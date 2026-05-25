@@ -1,17 +1,17 @@
 //+------------------------------------------------------------------+
-//| BOSS_Controller_EA_V21_Stack.mq5                                  |
+//| BOSS_Controller_EA_V22_Stack.mq5                                  |
 //| EA-wise Monitor + Close Buttons + ProfitBank + Stack Analysis      |
 //| Dashboard only opens no trades. Closes only when buttons clicked.  |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "2.10"
-#property description "BOSS Controller V2.1 - EA-wise dashboard, close buttons, ProfitBank, $ range stack analysis"
+#property version   "2.20"
+#property description "BOSS Controller V2.2 - EA-wise dashboard, Misc orders, symbol summary, ProfitBank, $ range stack analysis"
 
 #include <Trade/Trade.mqh>
 CTrade trade;
 
 //================ GENERAL INPUTS =================//
-input string EA_Name = "BOSS_CONTROLLER_V21";
+input string EA_Name = "BOSS_CONTROLLER_V22";
 input bool   CurrentSymbolOnly = true;
 input bool   IncludeManualOrders = true;
 input int    SlippagePoints = 50;
@@ -44,7 +44,7 @@ input int    StackMinOrdersToShow = 1;
 input bool   StackSortByLoss = true;            // true = largest loss first, false = most orders first
 
 //================ EA MAGIC MAP =================//
-#define GROUPS 6
+#define GROUPS 7
 
 input bool EnableFalcon = true;
 input long FalconMagicBuy  = 432515;
@@ -62,12 +62,12 @@ input long AuraxMagicFrom = 20000;
 input long AuraxMagicTo   = 20999;
 
 input bool EnableGroup5 = true;
-input string Group5Name = "Hedge EA";          // change to SNIPER_V2 if required
-input long Group5MagicBuy  = 909090;
-input long Group5MagicSell = 909090;
+input string Group5Name = "Bumblebee";          // change to SNIPER_V2 if required
+input long Group5MagicBuy  = 45400115;
+input long Group5MagicSell = 45400215;
 
 //================ INTERNALS =================//
-string Prefix = "BOSS_V21_";
+string Prefix = "BOSS_V21_";   // keep old prefix so ProfitBank/global data continues
 string armedButton = "";
 datetime armedTime = 0;
 datetime LastScanTime = 0;
@@ -95,6 +95,7 @@ struct Stat
 
 struct StackZone
 {
+   string symbol;
    int side;                 // POSITION_TYPE_BUY / POSITION_TYPE_SELL
    double low;
    double high;
@@ -105,6 +106,7 @@ struct StackZone
 
 struct StackGroup
 {
+   string symbol;
    int side;
    double low;
    double high;
@@ -113,6 +115,18 @@ struct StackGroup
    double lots;
    double pl;
 };
+
+struct SymbolStat
+{
+   string symbol;
+   int buyOrders;
+   int sellOrders;
+   double buyLots;
+   double sellLots;
+   double buyPL;
+   double sellPL;
+};
+
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -207,6 +221,14 @@ void InitGroups()
    groupSellMagic[5] = 0;
    groupIsRange[5]   = false;
    groupIsManual[5]  = true;
+
+   // MISC = all other EA orders not matching configured EA groups and not manual
+   groupName[6]      = "MISC";
+   groupEnabled[6]   = true;
+   groupBuyMagic[6]  = -999999;
+   groupSellMagic[6] = -999999;
+   groupIsRange[6]   = false;
+   groupIsManual[6]  = false;
 }
 
 //+------------------------------------------------------------------+
@@ -214,6 +236,23 @@ bool PositionBelongsToGroup(int g, long magic, int type)
 {
    if(g < 0 || g >= GROUPS) return false;
    if(!groupEnabled[g]) return false;
+
+   // MISC group catches unknown EA magic numbers only.
+   // It excludes manual orders and all configured EA groups.
+   if(g == 6)
+   {
+      if(magic == 0)
+         return false;
+
+      for(int x=0; x<6; x++)
+      {
+         if(!groupEnabled[x]) continue;
+         if(PositionBelongsToGroup(x, magic, type))
+            return false;
+      }
+
+      return true;
+   }
 
    if(groupIsManual[g])
       return (magic == 0);
@@ -415,7 +454,7 @@ void DrawDashboard()
 {
    int y = StartY;
 
-   Label("TITLE", "BOSS CONTROLLER V2.1  |  EA-wise Monitor + Close + ProfitBank + Stack", StartX, y, clrAqua, 10);
+   Label("TITLE", "BOSS CONTROLLER V2.2  |  EA-wise Monitor + Close + ProfitBank + Stack + Misc", StartX, y, clrAqua, 10);
    y += 22;
 
    Label("BANK", "PROFIT BANK: $" + Money(ProfitBank), StartX, y, clrYellow, 10);
@@ -475,6 +514,12 @@ void DrawDashboard()
                   "   TOTAL P/L: " + Money(totalPL), StartX, y, PLColor(totalPL), 10);
    y += 28;
 
+   if(!CurrentSymbolOnly)
+   {
+      DrawSymbolDashboard(StartX, y);
+      y += 10;
+   }
+
    int gx = StartX;
    Button("ALL_BP", "ALL BUY +", gx, y, 90, 22, clrGreen); gx += 100;
    Button("ALL_BN", "ALL BUY -", gx, y, 90, 22, clrMaroon); gx += 100;
@@ -495,19 +540,107 @@ void DrawDashboard()
 }
 
 //+------------------------------------------------------------------+
-int FindZone(StackZone &zones[], int count, int side, double low)
+int FindSymbolStat(SymbolStat &stats[], string symbol)
 {
-   for(int i=0; i<count; i++)
-      if(zones[i].side == side && MathAbs(zones[i].low - low) < 0.0001)
+   for(int i=0; i<ArraySize(stats); i++)
+      if(stats[i].symbol == symbol)
          return i;
    return -1;
 }
 
 //+------------------------------------------------------------------+
-int FindZoneGroup(StackGroup &groups[], int count, int side, double low, int group)
+void DrawSymbolDashboard(int x, int &y)
+{
+   SymbolStat stats[];
+   ArrayResize(stats, 0);
+
+   for(int i=PositionsTotal()-1; i>=0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(!PositionSelectByTicket(ticket)) continue;
+
+      string sym = PositionGetString(POSITION_SYMBOL);
+      int type = (int)PositionGetInteger(POSITION_TYPE);
+      if(type != POSITION_TYPE_BUY && type != POSITION_TYPE_SELL) continue;
+
+      int idx = FindSymbolStat(stats, sym);
+      if(idx < 0)
+      {
+         idx = ArraySize(stats);
+         ArrayResize(stats, idx + 1);
+         stats[idx].symbol = sym;
+         stats[idx].buyOrders = 0;
+         stats[idx].sellOrders = 0;
+         stats[idx].buyLots = 0;
+         stats[idx].sellLots = 0;
+         stats[idx].buyPL = 0;
+         stats[idx].sellPL = 0;
+      }
+
+      double lot = PositionGetDouble(POSITION_VOLUME);
+      double pl = PositionPL();
+
+      if(type == POSITION_TYPE_BUY)
+      {
+         stats[idx].buyOrders++;
+         stats[idx].buyLots += lot;
+         stats[idx].buyPL += pl;
+      }
+      else if(type == POSITION_TYPE_SELL)
+      {
+         stats[idx].sellOrders++;
+         stats[idx].sellLots += lot;
+         stats[idx].sellPL += pl;
+      }
+   }
+
+   Label("SYM_TITLE", "SYMBOL SUMMARY - Account-wide because CurrentSymbolOnly=false", x, y, clrAqua, 10);
+   y += 20;
+
+   Label("SYM_HDR", "SYMBOL       BUY ORD/LOT/P&L        SELL ORD/LOT/P&L       NET P/L", x, y, clrYellow, 8);
+   y += 16;
+
+   for(int z=0; z<ArraySize(stats); z++)
+   {
+      double net = stats[z].buyPL + stats[z].sellPL;
+      string line = StringFormat("%-10s  B:%3d/%6.2f/%9s   S:%3d/%6.2f/%9s   %9s",
+                                 stats[z].symbol,
+                                 stats[z].buyOrders,
+                                 stats[z].buyLots,
+                                 Money(stats[z].buyPL),
+                                 stats[z].sellOrders,
+                                 stats[z].sellLots,
+                                 Money(stats[z].sellPL),
+                                 Money(net));
+
+      Label("SYM_ROW_"+IntegerToString(z), line, x, y, PLColor(net), 8);
+      y += 16;
+   }
+
+   if(ArraySize(stats) == 0)
+   {
+      Label("SYM_EMPTY", "No open positions found", x, y, clrSilver, 8);
+      y += 16;
+   }
+
+   y += 8;
+}
+
+//+------------------------------------------------------------------+
+int FindZone(StackZone &zones[], int count, string symbol, int side, double low)
 {
    for(int i=0; i<count; i++)
-      if(groups[i].side == side && groups[i].group == group && MathAbs(groups[i].low - low) < 0.0001)
+      if(zones[i].symbol == symbol && zones[i].side == side && MathAbs(zones[i].low - low) < 0.0001)
+         return i;
+   return -1;
+}
+
+//+------------------------------------------------------------------+
+int FindZoneGroup(StackGroup &groups[], int count, string symbol, int side, double low, int group)
+{
+   for(int i=0; i<count; i++)
+      if(groups[i].symbol == symbol && groups[i].side == side && groups[i].group == group && MathAbs(groups[i].low - low) < 0.0001)
          return i;
    return -1;
 }
@@ -529,7 +662,8 @@ void BuildStackData(StackZone &zones[], int &zoneCount, StackGroup &groups[], in
       if(ticket == 0) continue;
       if(!PositionSelectByTicket(ticket)) continue;
 
-      if(CurrentSymbolOnly && PositionGetString(POSITION_SYMBOL) != _Symbol)
+      string symbol = PositionGetString(POSITION_SYMBOL);
+      if(CurrentSymbolOnly && symbol != _Symbol)
          continue;
 
       int type = (int)PositionGetInteger(POSITION_TYPE);
@@ -545,11 +679,12 @@ void BuildStackData(StackZone &zones[], int &zoneCount, StackGroup &groups[], in
       double lot = PositionGetDouble(POSITION_VOLUME);
       double pl = PositionPL();
 
-      int zi = FindZone(zones, zoneCount, type, low);
+      int zi = FindZone(zones, zoneCount, symbol, type, low);
       if(zi < 0)
       {
          ArrayResize(zones, zoneCount + 1);
          zi = zoneCount;
+         zones[zi].symbol = symbol;
          zones[zi].side = type;
          zones[zi].low = low;
          zones[zi].high = high;
@@ -562,11 +697,12 @@ void BuildStackData(StackZone &zones[], int &zoneCount, StackGroup &groups[], in
       zones[zi].lots += lot;
       zones[zi].pl += pl;
 
-      int gi = FindZoneGroup(groups, groupCount, type, low, g);
+      int gi = FindZoneGroup(groups, groupCount, symbol, type, low, g);
       if(gi < 0)
       {
          ArrayResize(groups, groupCount + 1);
          gi = groupCount;
+         groups[gi].symbol = symbol;
          groups[gi].side = type;
          groups[gi].low = low;
          groups[gi].high = high;
@@ -624,12 +760,12 @@ void SortZones(StackZone &zones[], int count)
 }
 
 //+------------------------------------------------------------------+
-string BestEAByOrders(StackGroup &groups[], int groupCount, int side, double low)
+string BestEAByOrders(StackGroup &groups[], int groupCount, string symbol, int side, double low)
 {
    int best = -1;
    for(int i=0; i<groupCount; i++)
    {
-      if(groups[i].side != side || MathAbs(groups[i].low - low) > 0.0001) continue;
+      if(groups[i].symbol != symbol || groups[i].side != side || MathAbs(groups[i].low - low) > 0.0001) continue;
       if(best < 0 || groups[i].orders > groups[best].orders)
          best = i;
    }
@@ -638,12 +774,12 @@ string BestEAByOrders(StackGroup &groups[], int groupCount, int side, double low
 }
 
 //+------------------------------------------------------------------+
-string BestEAByLoss(StackGroup &groups[], int groupCount, int side, double low)
+string BestEAByLoss(StackGroup &groups[], int groupCount, string symbol, int side, double low)
 {
    int best = -1;
    for(int i=0; i<groupCount; i++)
    {
-      if(groups[i].side != side || MathAbs(groups[i].low - low) > 0.0001) continue;
+      if(groups[i].symbol != symbol || groups[i].side != side || MathAbs(groups[i].low - low) > 0.0001) continue;
       if(best < 0 || groups[i].pl < groups[best].pl)
          best = i;
    }
@@ -657,7 +793,10 @@ void DrawStackSide(string title, int side, StackZone &zones[], int zoneCount, St
    Label("STACK_"+title+"_TITLE", title + " STACKS  |  Range: $" + DoubleToString(StackRangeUSD, 1), x, y, (side==POSITION_TYPE_BUY ? clrLime : clrTomato), 9);
    y += 18;
 
-   Label("STACK_"+title+"_HDR", "ZONE              ORD   LOT     P/L        MAX ORDERS EA          MAX LOSS EA", x, y, clrYellow, 8);
+   if(CurrentSymbolOnly)
+      Label("STACK_"+title+"_HDR", "ZONE              ORD   LOT     P/L        MAX ORDERS EA          MAX LOSS EA", x, y, clrYellow, 8);
+   else
+      Label("STACK_"+title+"_HDR", "SYMBOL   ZONE              ORD   LOT     P/L        MAX ORDERS EA          MAX LOSS EA", x, y, clrYellow, 8);
    y += 16;
 
    int shown = 0;
@@ -667,13 +806,28 @@ void DrawStackSide(string title, int side, StackZone &zones[], int zoneCount, St
       if(zones[i].orders < StackMinOrdersToShow) continue;
 
       string zoneTxt = DoubleToString(zones[i].low, 0) + "-" + DoubleToString(zones[i].high, 0);
-      string line = StringFormat("%-16s %3d  %6.2f  %9s   %-20s %-20s",
-                                 zoneTxt,
-                                 zones[i].orders,
-                                 zones[i].lots,
-                                 Money(zones[i].pl),
-                                 BestEAByOrders(groups, groupCount, side, zones[i].low),
-                                 BestEAByLoss(groups, groupCount, side, zones[i].low));
+      string line;
+      if(CurrentSymbolOnly)
+      {
+         line = StringFormat("%-16s %3d  %6.2f  %9s   %-20s %-20s",
+                             zoneTxt,
+                             zones[i].orders,
+                             zones[i].lots,
+                             Money(zones[i].pl),
+                             BestEAByOrders(groups, groupCount, zones[i].symbol, side, zones[i].low),
+                             BestEAByLoss(groups, groupCount, zones[i].symbol, side, zones[i].low));
+      }
+      else
+      {
+         line = StringFormat("%-8s %-16s %3d  %6.2f  %9s   %-20s %-20s",
+                             zones[i].symbol,
+                             zoneTxt,
+                             zones[i].orders,
+                             zones[i].lots,
+                             Money(zones[i].pl),
+                             BestEAByOrders(groups, groupCount, zones[i].symbol, side, zones[i].low),
+                             BestEAByLoss(groups, groupCount, zones[i].symbol, side, zones[i].low));
+      }
 
       Label("STACK_"+title+"_ROW_"+IntegerToString(shown), line, x, y, PLColor(zones[i].pl), 8);
       y += 16;
@@ -699,7 +853,10 @@ void DrawStackDashboard(int x, int y)
    BuildStackData(zones, zoneCount, zoneGroups, groupCount);
    SortZones(zones, zoneCount);
 
-   Label("STACK_MAIN", "STACK ANALYSIS - EA-wise max stack by $ range", x, y, clrAqua, 10);
+   if(CurrentSymbolOnly)
+      Label("STACK_MAIN", "STACK ANALYSIS - EA-wise max stack by $ range", x, y, clrAqua, 10);
+   else
+      Label("STACK_MAIN", "STACK ANALYSIS - Symbol-wise + EA-wise max stack by $ range", x, y, clrAqua, 10);
    y += 22;
 
    DrawStackSide("BUY", POSITION_TYPE_BUY, zones, zoneCount, zoneGroups, groupCount, x, y);
