@@ -1,69 +1,42 @@
 //+------------------------------------------------------------------+
-//|                                                   IronMan.mq5    |
-//|                  Manual Trigger BTCUSD Hedge Grid + M15 Exit - No Backfill     |
-//|                                                                  |
-//|  Logic:                                                          |
-//|  - Manual BUY or SELL on same symbol starts the cycle             |
-//|  - Base price = first detected manual order price                 |
-//|  - No backfill: only fresh grid level opens BUY + SELL       |
-//|  - No duplicate pair in same grid level                           |
-//|  - M15 reversal candle patterns close matching side               |
-//|  - Broker-level TP at entry + optional individual trailing        |
+//|                                      BTCUSD_Grid_Pattern_v1_10.mq5 |
+//|                         Grid with candle patterns, broker TP, dash |
 //+------------------------------------------------------------------+
-#property strict
+#property copyright "Copyright 2025"
 #property version   "1.10"
-#property description "IronMan - BTCUSD manual trigger hedge grid with M15 candle-pattern exits"
+#property strict
 
-#include <Trade/Trade.mqh>
-CTrade trade;
+#include <Trade\Trade.mqh>
 
 //------------------------- Inputs ----------------------------------
-input string InpEAName                  = "IronMan";
-input long   MagicNumber                = 20260523;
-
-input double LotSize                    = 0.01;
-input double GridStepUSD                = 100.0;
-input int    MaxEAPositions             = 100;
-input int    MaxPairsPerTick            = 3;
-input int    SlippagePoints             = 50;
-
-input bool   UseBrokerTP                = true;
-input double TakeProfitUSD              = 150.0;
-
-input bool   UseTrailing                = true;
-input double TrailStartUSD              = 150.0;
-input double TrailGapUSD                = 75.0;
-
-input bool   UseDDPause                 = true;
-input double MaxFloatingLossUSD         = 3000.0;
-
-input ENUM_TIMEFRAMES PatternTF         = PERIOD_M15;
-input bool   CloseBuyOnBearishPattern   = true;
-input bool   CloseSellOnBullishPattern  = true;
-input bool   UseHangingMan              = true;
-input bool   UseInvertedHammer          = true;
-input bool   UseEveningStar             = true;
-input bool   UseHammer                  = true;
-input bool   UseMorningStar             = true;
-
-input bool   CloseOnlyIronManOrders     = true;
-input bool   ShowDashboard              = true;
+input string   InpEAName             = "BTCUSD_Grid_Pattern";
+input bool     InpAutoStart          = true;      // Default auto start. false = wait for manual trigger
+input bool     InpManualTrigger      = false;     // If true, waits for manual order magic 0
+input double   InpGridStep           = 100.0;     // Grid step in dollars
+input double   InpLotSize            = 0.01;      // Fixed lot size
+input int      InpMaxGridLevels      = 10;        // Maximum levels each side from base
+input bool     InpUsePatternExit     = true;      // Use M15 candlestick patterns to exit/reverse
+input bool     InpUseBrokerTP        = true;      // Apply broker-level TP
+input double   InpBrokerTP_USD       = 20.0;      // Broker TP distance in USD
+input double   InpTrailTrigger       = 2.0;       // Start trailing when profit >= $2
+input double   InpTrailStep          = 1.0;       // Trail step in USD
+input int      InpSlippagePoints     = 50;
+input long     InpMagic              = 20250522;
+input bool     InpShowDashboard      = true;
 
 //------------------------- Globals ---------------------------------
-double   g_base_price       = 0.0;
-bool     g_cycle_active     = false;
-datetime g_last_pattern_bar = 0;
-int      g_last_executed_level = 0;
+CTrade         g_trade;
+double         g_initialPrice          = 0.0;
+int            g_lastBuyLevel          = 0;       // Negative side levels: -1, -2, -3...
+int            g_lastSellLevel         = 0;       // Positive side levels: 1, 2, 3...
+bool           g_gridActive            = false;
+bool           g_patternTradeActive    = false;
+double         g_patternTradeOpenPrice = 0.0;
+double         g_lastProfitLock        = 0.0;
+datetime       g_lastPatternBarTime    = 0;
 
-//------------------------- Helpers ---------------------------------
-string SideText(const long type)
-{
-   if(type == POSITION_TYPE_BUY)  return "BUY";
-   if(type == POSITION_TYPE_SELL) return "SELL";
-   return "UNKNOWN";
-}
-
-double NormalizeVolume(double lots)
+//+------------------------------------------------------------------+
+double NormalizeLots(double lots)
 {
    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
@@ -76,68 +49,26 @@ double NormalizeVolume(double lots)
    return NormalizeDouble(lots, 2);
 }
 
-bool IsIronManPosition()
+//+------------------------------------------------------------------+
+bool IsEAPosition()
 {
-   if(PositionGetString(POSITION_SYMBOL) != _Symbol)
-      return false;
-
-   if((long)PositionGetInteger(POSITION_MAGIC) != MagicNumber)
-      return false;
-
-   return true;
+   return (PositionGetString(POSITION_SYMBOL) == _Symbol &&
+           (long)PositionGetInteger(POSITION_MAGIC) == InpMagic);
 }
 
+//+------------------------------------------------------------------+
 bool IsManualPosition()
 {
-   if(PositionGetString(POSITION_SYMBOL) != _Symbol)
-      return false;
-
-   long magic = (long)PositionGetInteger(POSITION_MAGIC);
-   return (magic == 0);
+   return (PositionGetString(POSITION_SYMBOL) == _Symbol &&
+           (long)PositionGetInteger(POSITION_MAGIC) == 0);
 }
 
-int CountIronManPositions(int side = -1)
+//+------------------------------------------------------------------+
+bool FindManualBase(double &basePrice)
 {
-   int count = 0;
-
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket == 0) continue;
-
-      if(!IsIronManPosition()) continue;
-
-      long type = (long)PositionGetInteger(POSITION_TYPE);
-      if(side == -1 || type == side)
-         count++;
-   }
-
-   return count;
-}
-
-double IronManFloatingPL()
-{
-   double pl = 0.0;
-
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket == 0) continue;
-
-      if(!IsIronManPosition()) continue;
-
-      pl += PositionGetDouble(POSITION_PROFIT);
-      pl += PositionGetDouble(POSITION_SWAP);
-   }
-
-   return pl;
-}
-
-bool FindManualBase(double &base_price)
-{
-   datetime oldest = LONG_MAX;
    bool found = false;
-   base_price = 0.0;
+   datetime oldest = LONG_MAX;
+   basePrice = 0.0;
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -150,7 +81,7 @@ bool FindManualBase(double &base_price)
       if(t < oldest)
       {
          oldest = t;
-         base_price = PositionGetDouble(POSITION_PRICE_OPEN);
+         basePrice = PositionGetDouble(POSITION_PRICE_OPEN);
          found = true;
       }
    }
@@ -158,403 +89,411 @@ bool FindManualBase(double &base_price)
    return found;
 }
 
-bool LevelAlreadyTraded(int level)
+//+------------------------------------------------------------------+
+int CurrentLevel()
 {
-   string tag = InpEAName + "_LVL_" + IntegerToString(level);
-
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket == 0) continue;
-
-      if(!IsIronManPosition()) continue;
-
-      string cmt = PositionGetString(POSITION_COMMENT);
-      if(StringFind(cmt, tag) >= 0)
-         return true;
-   }
-
-   return false;
-}
-
-bool OpenMarketOrder(ENUM_ORDER_TYPE order_type, int level)
-{
-   double lots = NormalizeVolume(LotSize);
-   double ask  = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double bid  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   int digits  = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-
-   string comment = InpEAName + "_LVL_" + IntegerToString(level);
-
-   trade.SetExpertMagicNumber(MagicNumber);
-   trade.SetDeviationInPoints(SlippagePoints);
-
-   double tp = 0.0;
-
-   if(order_type == ORDER_TYPE_BUY)
-   {
-      if(UseBrokerTP)
-         tp = NormalizeDouble(ask + TakeProfitUSD, digits);
-
-      return trade.Buy(lots, _Symbol, ask, 0.0, tp, comment);
-   }
-
-   if(order_type == ORDER_TYPE_SELL)
-   {
-      if(UseBrokerTP)
-         tp = NormalizeDouble(bid - TakeProfitUSD, digits);
-
-      return trade.Sell(lots, _Symbol, bid, 0.0, tp, comment);
-   }
-
-   return false;
-}
-
-bool OpenBuySellPair(int level)
-{
-   if(CountIronManPositions() + 2 > MaxEAPositions)
-      return false;
-
-   if(LevelAlreadyTraded(level))
-      return false;
-
-   bool b = OpenMarketOrder(ORDER_TYPE_BUY, level);
-   bool s = OpenMarketOrder(ORDER_TYPE_SELL, level);
-
-   return (b && s);
-}
-
-int CurrentGridLevel()
-{
-   double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   if(g_base_price <= 0.0 || GridStepUSD <= 0.0)
+   if(g_initialPrice <= 0 || InpGridStep <= 0)
       return 0;
 
-   double diff = price - g_base_price;
+   double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double diff  = price - g_initialPrice;
 
-   if(diff >= GridStepUSD)
-      return (int)MathFloor(diff / GridStepUSD);
+   if(diff >= InpGridStep)
+      return (int)MathFloor(diff / InpGridStep);
 
-   if(diff <= -GridStepUSD)
-      return (int)MathCeil(diff / GridStepUSD);
+   if(diff <= -InpGridStep)
+      return (int)MathCeil(diff / InpGridStep);
 
    return 0;
 }
 
-void ManageGridEntries()
+//+------------------------------------------------------------------+
+int CountPositions(int side = -1)
 {
-   if(!g_cycle_active || g_base_price <= 0.0)
-      return;
-
-   if(UseDDPause && IronManFloatingPL() <= -MaxFloatingLossUSD)
-      return;
-
-   int curLevel = CurrentGridLevel();
-
-   // No trade inside base zone. Reset last level so next breakout from base can trade.
-   if(curLevel == 0)
-   {
-      g_last_executed_level = 0;
-      return;
-   }
-
-   // v1.10 No Backfill:
-   // Open only when price enters one fresh grid level.
-   // Do NOT open all missed old levels at current market price.
-   if(curLevel == g_last_executed_level)
-      return;
-
-   if(CountIronManPositions() + 2 > MaxEAPositions)
-      return;
-
-   // Prevent duplicate pair at the same still-active level.
-   // After one side is closed by candle pattern, EA will still continue
-   // on the NEXT fresh grid level because curLevel will change.
-   if(LevelAlreadyTraded(curLevel))
-   {
-      g_last_executed_level = curLevel;
-      return;
-   }
-
-   if(OpenBuySellPair(curLevel))
-      g_last_executed_level = curLevel;
-}
-
-void ManageTrailing()
-{
-   if(!UseTrailing)
-      return;
-
-   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   int count = 0;
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
       if(ticket == 0) continue;
 
-      if(!IsIronManPosition()) continue;
-
-      long   type      = (long)PositionGetInteger(POSITION_TYPE);
-      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-      double oldSL     = PositionGetDouble(POSITION_SL);
-      double oldTP     = PositionGetDouble(POSITION_TP);
-
-      if(type == POSITION_TYPE_BUY)
-      {
-         double move = bid - openPrice;
-         if(move >= TrailStartUSD)
-         {
-            double newSL = NormalizeDouble(bid - TrailGapUSD, digits);
-            if(oldSL == 0.0 || newSL > oldSL)
-               trade.PositionModify(ticket, newSL, 0.0); // remove TP after trailing starts
-         }
-      }
-
-      if(type == POSITION_TYPE_SELL)
-      {
-         double move = openPrice - ask;
-         if(move >= TrailStartUSD)
-         {
-            double newSL = NormalizeDouble(ask + TrailGapUSD, digits);
-            if(oldSL == 0.0 || newSL < oldSL)
-               trade.PositionModify(ticket, newSL, 0.0); // remove TP after trailing starts
-         }
-      }
-   }
-}
-
-void CloseSide(int side, string reason)
-{
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket == 0) continue;
-
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
-         continue;
-
-      if(CloseOnlyIronManOrders && !IsIronManPosition())
-         continue;
+      if(!IsEAPosition()) continue;
 
       long type = (long)PositionGetInteger(POSITION_TYPE);
-      if(type != side)
-         continue;
-
-      trade.PositionClose(ticket);
+      if(side == -1 || type == side)
+         count++;
    }
 
-   Print(InpEAName, ": closed ", SideText(side), " orders. Reason: ", reason);
+   return count;
 }
 
-//---------------------- Candle Pattern Logic ------------------------
-double Body(int shift)
+//+------------------------------------------------------------------+
+double FloatingPL()
 {
-   return MathAbs(iClose(_Symbol, PatternTF, shift) - iOpen(_Symbol, PatternTF, shift));
+   double pl = 0.0;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+
+      if(!IsEAPosition()) continue;
+
+      pl += PositionGetDouble(POSITION_PROFIT);
+      pl += PositionGetDouble(POSITION_SWAP);
+   }
+
+   return pl;
 }
 
-double RangeCandle(int shift)
+//+------------------------------------------------------------------+
+bool OpenBuy(string comment)
 {
-   return MathAbs(iHigh(_Symbol, PatternTF, shift) - iLow(_Symbol, PatternTF, shift));
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double tp = 0.0;
+
+   if(InpUseBrokerTP)
+      tp = NormalizeDouble(ask + InpBrokerTP_USD, digits);
+
+   g_trade.SetExpertMagicNumber(InpMagic);
+   g_trade.SetDeviationInPoints(InpSlippagePoints);
+
+   return g_trade.Buy(NormalizeLots(InpLotSize), _Symbol, ask, 0.0, tp, comment);
 }
 
-bool Bullish(int shift)
+//+------------------------------------------------------------------+
+bool OpenSell(string comment)
 {
-   return iClose(_Symbol, PatternTF, shift) > iOpen(_Symbol, PatternTF, shift);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double tp = 0.0;
+
+   if(InpUseBrokerTP)
+      tp = NormalizeDouble(bid - InpBrokerTP_USD, digits);
+
+   g_trade.SetExpertMagicNumber(InpMagic);
+   g_trade.SetDeviationInPoints(InpSlippagePoints);
+
+   return g_trade.Sell(NormalizeLots(InpLotSize), _Symbol, bid, 0.0, tp, comment);
 }
 
-bool Bearish(int shift)
+//+------------------------------------------------------------------+
+void CheckStart()
 {
-   return iClose(_Symbol, PatternTF, shift) < iOpen(_Symbol, PatternTF, shift);
-}
-
-bool IsHammer(int shift)
-{
-   double o = iOpen(_Symbol, PatternTF, shift);
-   double c = iClose(_Symbol, PatternTF, shift);
-   double h = iHigh(_Symbol, PatternTF, shift);
-   double l = iLow(_Symbol, PatternTF, shift);
-
-   double body = MathAbs(c - o);
-   double range = h - l;
-   if(range <= 0 || body <= 0) return false;
-
-   double upper = h - MathMax(o, c);
-   double lower = MathMin(o, c) - l;
-
-   return (lower >= body * 2.0 && upper <= body * 0.7 && body <= range * 0.4);
-}
-
-bool IsInvertedHammerOrShootingStar(int shift)
-{
-   double o = iOpen(_Symbol, PatternTF, shift);
-   double c = iClose(_Symbol, PatternTF, shift);
-   double h = iHigh(_Symbol, PatternTF, shift);
-   double l = iLow(_Symbol, PatternTF, shift);
-
-   double body = MathAbs(c - o);
-   double range = h - l;
-   if(range <= 0 || body <= 0) return false;
-
-   double upper = h - MathMax(o, c);
-   double lower = MathMin(o, c) - l;
-
-   return (upper >= body * 2.0 && lower <= body * 0.7 && body <= range * 0.4);
-}
-
-bool IsEveningStar()
-{
-   // Uses closed candles: shift 3, 2, 1
-   if(Bars(_Symbol, PatternTF) < 5) return false;
-
-   double body3 = Body(3);
-   double body2 = Body(2);
-   double body1 = Body(1);
-
-   if(!Bullish(3)) return false;
-   if(!Bearish(1)) return false;
-   if(body2 > body3 * 0.6) return false;
-
-   double midFirst = (iOpen(_Symbol, PatternTF, 3) + iClose(_Symbol, PatternTF, 3)) / 2.0;
-
-   return (iClose(_Symbol, PatternTF, 1) < midFirst && body1 >= body2);
-}
-
-bool IsMorningStar()
-{
-   // Uses closed candles: shift 3, 2, 1
-   if(Bars(_Symbol, PatternTF) < 5) return false;
-
-   double body3 = Body(3);
-   double body2 = Body(2);
-   double body1 = Body(1);
-
-   if(!Bearish(3)) return false;
-   if(!Bullish(1)) return false;
-   if(body2 > body3 * 0.6) return false;
-
-   double midFirst = (iOpen(_Symbol, PatternTF, 3) + iClose(_Symbol, PatternTF, 3)) / 2.0;
-
-   return (iClose(_Symbol, PatternTF, 1) > midFirst && body1 >= body2);
-}
-
-void CheckPatternExit()
-{
-   datetime closedBarTime = iTime(_Symbol, PatternTF, 1);
-   if(closedBarTime <= 0 || closedBarTime == g_last_pattern_bar)
+   if(g_gridActive)
       return;
 
-   g_last_pattern_bar = closedBarTime;
+   double manualBase = 0.0;
 
-   bool bearishPattern = false;
-   bool bullishPattern = false;
+   if(InpManualTrigger || !InpAutoStart)
+   {
+      if(FindManualBase(manualBase))
+      {
+         g_initialPrice = manualBase;
+         g_lastBuyLevel = CurrentLevel();
+         g_lastSellLevel = CurrentLevel();
+         g_gridActive = true;
+         Print(InpEAName, ": Manual trigger started. Base = ", DoubleToString(g_initialPrice, _Digits));
+      }
+      return;
+   }
 
-   if(UseHangingMan && IsHammer(1) && Bearish(1))
-      bearishPattern = true;
+   g_initialPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   g_lastBuyLevel = 0;
+   g_lastSellLevel = 0;
+   g_gridActive = true;
 
-   if(UseInvertedHammer && IsInvertedHammerOrShootingStar(1) && Bearish(1))
-      bearishPattern = true;
-
-   if(UseEveningStar && IsEveningStar())
-      bearishPattern = true;
-
-   if(UseHammer && IsHammer(1) && Bullish(1))
-      bullishPattern = true;
-
-   if(UseMorningStar && IsMorningStar())
-      bullishPattern = true;
-
-   if(CloseBuyOnBearishPattern && bearishPattern)
-      CloseSide(POSITION_TYPE_BUY, "M15 bearish reversal pattern");
-
-   if(CloseSellOnBullishPattern && bullishPattern)
-      CloseSide(POSITION_TYPE_SELL, "M15 bullish reversal pattern");
+   Print(InpEAName, ": Auto started. Base = ", DoubleToString(g_initialPrice, _Digits));
 }
 
-//------------------------- Dashboard --------------------------------
+//+------------------------------------------------------------------+
+//| Core grid preserved: BUY on drop, SELL on rise                    |
+//| v1.10: no backfill, only the next fresh current level             |
+//+------------------------------------------------------------------+
+void ManageGrid()
+{
+   if(!g_gridActive || g_initialPrice <= 0)
+      return;
+
+   if(g_patternTradeActive)
+      return;
+
+   int level = CurrentLevel();
+
+   if(level > 0)
+   {
+      if(level > InpMaxGridLevels)
+         return;
+
+      if(level != g_lastSellLevel)
+      {
+         if(OpenSell(InpEAName + "_SELL_L" + IntegerToString(level)))
+         {
+            g_lastSellLevel = level;
+            Print("Fresh SELL grid opened at level ", level);
+         }
+      }
+   }
+
+   if(level < 0)
+   {
+      if(MathAbs(level) > InpMaxGridLevels)
+         return;
+
+      if(level != g_lastBuyLevel)
+      {
+         if(OpenBuy(InpEAName + "_BUY_L" + IntegerToString(level)))
+         {
+            g_lastBuyLevel = level;
+            Print("Fresh BUY grid opened at level ", level);
+         }
+      }
+   }
+
+   if(level == 0)
+   {
+      g_lastBuyLevel = 0;
+      g_lastSellLevel = 0;
+   }
+}
+
+//+------------------------------------------------------------------+
+bool IsEveningStar()
+{
+   MqlRates candles[3];
+   if(CopyRates(_Symbol, PERIOD_M15, 1, 3, candles) != 3)
+      return false;
+
+   double body1 = MathAbs(candles[2].close - candles[2].open);
+   double body2 = MathAbs(candles[1].close - candles[1].open);
+   double body3 = MathAbs(candles[0].close - candles[0].open);
+
+   bool firstBullish = candles[2].close > candles[2].open;
+   bool thirdBearish = candles[0].close < candles[0].open;
+   bool smallMiddle  = body2 < body1 * 0.5 && body2 < body3 * 0.7;
+   double midFirst   = (candles[2].open + candles[2].close) / 2.0;
+
+   return (firstBullish && thirdBearish && smallMiddle && candles[0].close < midFirst);
+}
+
+//+------------------------------------------------------------------+
+bool IsHangingHammer()
+{
+   MqlRates candle[1];
+   if(CopyRates(_Symbol, PERIOD_M15, 1, 1, candle) != 1)
+      return false;
+
+   double body = MathAbs(candle[0].close - candle[0].open);
+   double range = candle[0].high - candle[0].low;
+   if(body <= 0 || range <= 0) return false;
+
+   double lowerWick = MathMin(candle[0].open, candle[0].close) - candle[0].low;
+   double upperWick = candle[0].high - MathMax(candle[0].open, candle[0].close);
+
+   if(lowerWick >= 2.0 * body && upperWick <= body * 0.7 && body <= range * 0.4)
+   {
+      MqlRates prev[2];
+      if(CopyRates(_Symbol, PERIOD_M15, 2, 2, prev) == 2)
+         return (prev[0].close > prev[0].open && prev[1].close > prev[1].open);
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+bool IsReverseHammer()
+{
+   MqlRates candle[1];
+   if(CopyRates(_Symbol, PERIOD_M15, 1, 1, candle) != 1)
+      return false;
+
+   double body = MathAbs(candle[0].close - candle[0].open);
+   double range = candle[0].high - candle[0].low;
+   if(body <= 0 || range <= 0) return false;
+
+   double upperWick = candle[0].high - MathMax(candle[0].open, candle[0].close);
+   double lowerWick = MathMin(candle[0].open, candle[0].close) - candle[0].low;
+
+   if(upperWick >= 2.0 * body && lowerWick <= body * 0.7 && body <= range * 0.4)
+   {
+      MqlRates prev[2];
+      if(CopyRates(_Symbol, PERIOD_M15, 2, 2, prev) == 2)
+         return (prev[0].close < prev[0].open && prev[1].close < prev[1].open);
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+void CheckPatternAndReverse()
+{
+   datetime barTime = iTime(_Symbol, PERIOD_M15, 1);
+   if(barTime <= 0 || barTime == g_lastPatternBarTime)
+      return;
+
+   g_lastPatternBarTime = barTime;
+
+   bool bearishSignal = IsEveningStar() || IsHangingHammer();
+   bool bullishSignal = IsReverseHammer();
+
+   if(!(bearishSignal || bullishSignal))
+      return;
+
+   CloseAllPositions();
+
+   g_patternTradeActive = true;
+
+   bool success = false;
+   double price = 0.0;
+
+   if(bearishSignal)
+   {
+      price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      success = OpenSell(InpEAName + "_PATTERN_SELL");
+   }
+   else
+   {
+      price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      success = OpenBuy(InpEAName + "_PATTERN_BUY");
+   }
+
+   if(success)
+   {
+      g_patternTradeOpenPrice = price;
+      g_lastProfitLock = 0.0;
+      g_initialPrice = price;
+      g_lastBuyLevel = 0;
+      g_lastSellLevel = 0;
+
+      Print("Pattern signal: ", bearishSignal ? "Bearish - SELL" : "Bullish - BUY",
+            " opened at ", DoubleToString(price, _Digits));
+   }
+}
+
+//+------------------------------------------------------------------+
+void ManageTrailingStop()
+{
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+
+      if(!IsEAPosition()) continue;
+
+      double currentProfit = PositionGetDouble(POSITION_PROFIT);
+      if(currentProfit < InpTrailTrigger)
+         continue;
+
+      int profitFloor = (int)MathFloor(currentProfit);
+
+      if(profitFloor > g_lastProfitLock && profitFloor >= (int)InpTrailTrigger)
+      {
+         double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+         long type = (long)PositionGetInteger(POSITION_TYPE);
+         double lockProfit = profitFloor - InpTrailStep;
+         if(lockProfit < 0) lockProfit = 0;
+
+         double newSL = 0.0;
+
+         if(type == POSITION_TYPE_BUY)
+            newSL = NormalizeDouble(openPrice + lockProfit, digits);
+         else
+            newSL = NormalizeDouble(openPrice - lockProfit, digits);
+
+         if(g_trade.PositionModify(ticket, newSL, 0.0))
+         {
+            g_lastProfitLock = profitFloor;
+            Print("Trailing SL moved to ", DoubleToString(newSL, digits));
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+void CloseAllPositions()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+
+      if(IsEAPosition())
+         g_trade.PositionClose(ticket);
+   }
+}
+
+//+------------------------------------------------------------------+
 void Dashboard()
 {
-   if(!ShowDashboard)
+   if(!InpShowDashboard)
    {
       Comment("");
       return;
    }
 
-   double manualBase = 0.0;
-   bool manualFound = FindManualBase(manualBase);
+   string mode = InpAutoStart && !InpManualTrigger ? "AUTO START" : "MANUAL TRIGGER";
+   string status = g_gridActive ? "ACTIVE" : "WAITING";
+   if(g_patternTradeActive) status = "PATTERN TRADE ACTIVE";
 
-   string status = "WAITING MANUAL ORDER";
-   if(g_cycle_active) status = "ACTIVE";
-   if(UseDDPause && IronManFloatingPL() <= -MaxFloatingLossUSD) status = "DD PAUSED";
+   int level = CurrentLevel();
 
    string text;
-   text  = "==== " + InpEAName + " ====\n";
+   text  = "==== " + InpEAName + " v1.10 ====\n";
    text += "Symbol: " + _Symbol + "\n";
+   text += "Mode: " + mode + "\n";
    text += "Status: " + status + "\n";
-   text += "Manual Trigger Found: " + string(manualFound ? "YES" : "NO") + "\n";
-   text += "Base Price: " + DoubleToString(g_base_price, _Digits) + "\n";
-   text += "Current Grid Level: " + IntegerToString(CurrentGridLevel()) + "\n";
-   text += "Last Executed Level: " + IntegerToString(g_last_executed_level) + "\n";
-   text += "Grid Step: $" + DoubleToString(GridStepUSD, 2) + "\n\n";
+   text += "Base Price: " + DoubleToString(g_initialPrice, _Digits) + "\n";
+   text += "Current Level: " + IntegerToString(level) + "\n";
+   text += "Last BUY Level: " + IntegerToString(g_lastBuyLevel) + "\n";
+   text += "Last SELL Level: " + IntegerToString(g_lastSellLevel) + "\n";
+   text += "Grid Step: $" + DoubleToString(InpGridStep, 2) + "\n";
+   text += "No Backfill: ON - only next fresh level\n\n";
 
-   text += "BUY Orders: " + IntegerToString(CountIronManPositions(POSITION_TYPE_BUY)) + "\n";
-   text += "SELL Orders: " + IntegerToString(CountIronManPositions(POSITION_TYPE_SELL)) + "\n";
-   text += "Total EA Orders: " + IntegerToString(CountIronManPositions()) + " / " + IntegerToString(MaxEAPositions) + "\n";
-   text += "Floating P/L: $" + DoubleToString(IronManFloatingPL(), 2) + "\n\n";
+   text += "BUY Orders: " + IntegerToString(CountPositions(POSITION_TYPE_BUY)) + "\n";
+   text += "SELL Orders: " + IntegerToString(CountPositions(POSITION_TYPE_SELL)) + "\n";
+   text += "Total Orders: " + IntegerToString(CountPositions()) + "\n";
+   text += "Floating P/L: $" + DoubleToString(FloatingPL(), 2) + "\n\n";
 
-   text += "Pattern TF: M15\n";
-   text += "Bearish Pattern => Close BUY\n";
-   text += "Bullish Pattern => Close SELL\n";
+   text += "Broker TP: " + string(InpUseBrokerTP ? "ON" : "OFF") + " | $" + DoubleToString(InpBrokerTP_USD, 2) + "\n";
+   text += "Pattern Exit M15: " + string(InpUsePatternExit ? "ON" : "OFF") + "\n";
+   text += "Bearish pattern: Close all + open SELL\n";
+   text += "Bullish pattern: Close all + open BUY\n";
 
    Comment(text);
 }
 
-//------------------------- MT5 Events --------------------------------
+//+------------------------------------------------------------------+
 int OnInit()
 {
-   trade.SetExpertMagicNumber(MagicNumber);
-   trade.SetDeviationInPoints(SlippagePoints);
+   g_trade.SetExpertMagicNumber(InpMagic);
+   g_trade.SetDeviationInPoints(InpSlippagePoints);
 
-   Print(InpEAName, " initialized on ", _Symbol);
+   Print(InpEAName, " v1.10 initialized on ", _Symbol);
    return INIT_SUCCEEDED;
 }
 
+//+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
    Comment("");
 }
 
+//+------------------------------------------------------------------+
 void OnTick()
 {
-   double manualBase = 0.0;
+   CheckStart();
 
-   if(!g_cycle_active)
-   {
-      if(FindManualBase(manualBase))
-      {
-         g_base_price = manualBase;
-         g_last_executed_level = CurrentGridLevel(); // no backfill when cycle starts
-         g_cycle_active = true;
-         Print(InpEAName, ": cycle started from manual base price ", DoubleToString(g_base_price, _Digits));
-      }
-   }
+   if(g_gridActive)
+      ManageGrid();
 
-   if(g_cycle_active)
-   {
-      ManageGridEntries();
-      ManageTrailing();
-      CheckPatternExit();
+   if(InpUsePatternExit)
+      CheckPatternAndReverse();
 
-      // Reset only when manual trigger and IronMan orders are fully gone
-      if(!FindManualBase(manualBase) && CountIronManPositions() == 0)
-      {
-         g_cycle_active = false;
-         g_base_price = 0.0;
-         g_last_executed_level = 0;
-         Print(InpEAName, ": cycle reset. Waiting for next manual order.");
-      }
-   }
+   if(g_patternTradeActive)
+      ManageTrailingStop();
 
    Dashboard();
 }
