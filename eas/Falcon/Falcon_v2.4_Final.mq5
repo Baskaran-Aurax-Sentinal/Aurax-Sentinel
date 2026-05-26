@@ -1,9 +1,9 @@
 //+------------------------------------------------------------------+
-//| Falcon Profit Engine v3.21                                       |
+//| Falcon Profit Engine v3.22                                       |
 //| Auto / Manual Trigger + Manual Base Stop + Hybrid Grid           |
 //+------------------------------------------------------------------+
 #property strict
-#property version "3.21"
+#property version "3.22"
 
 #include <Trade/Trade.mqh>
 CTrade trade;
@@ -43,18 +43,20 @@ input double Spacing_11_20  = 5.0;
 input double Spacing_21_35  = 8.0;
 input double Spacing_36_50  = 12.0;
 
-// Unified TP + trailing for all EA orders
+// Unified TP + SL/TP trailing for all EA orders
 input double OrderTP_USD     = 10.0;
 input double TrailStartUSD   = 2.0;
 input double TrailLockUSD    = 1.0;
 input double TrailGapUSD     = 2.0;
+input bool   EnableTPTrailing = true;
+input double TPTrailGapUSD    = 10.0;
 
 // Dashboard stacking analysis
 input double StackZoneUSD       = 5.0;
 input int    StackAlertOrders   = 5;
 
 // Profit Bank worst-order close
-input bool   EnableProfitBankClose     = true;
+input bool   EnableManualProfitBankClose = true;   // Button only: no auto close
 input int    ProfitBankLookbackDays    = 30;
 input double ProfitBankUsePercent      = 40.0;
 input double MinProfitBankToUse        = 5.0;
@@ -74,6 +76,9 @@ double buyAnchorPrice  = 0.0;
 double sellAnchorPrice = 0.0;
 
 datetime lastProfitBankCloseTime = 0;
+
+string BTN_CLOSE_WORST = "FALCON_BTN_CLOSE_WORST";
+string BTN_RESET_BANK_TIME = "FALCON_BTN_RESET_BANK_TIME";
 
 ulong manualBuyBaseTicket  = 0;
 ulong manualSellBaseTicket = 0;
@@ -594,8 +599,16 @@ void ManageAllOrderTrailing()
             double gapSL  = bid - TrailGapUSD;
             double newSL  = NormalizePrice(MathMax(lockSL, gapSL));
 
-            if(oldSL == 0.0 || newSL > oldSL)
-               trade.PositionModify(ticket, newSL, oldTP);
+            double newTP = oldTP;
+            if(EnableTPTrailing)
+            {
+               double trailTP = NormalizePrice(bid + TPTrailGapUSD);
+               if(oldTP == 0.0 || trailTP > oldTP)
+                  newTP = trailTP;
+            }
+
+            if(oldSL == 0.0 || newSL > oldSL || newTP != oldTP)
+               trade.PositionModify(ticket, newSL, newTP);
          }
       }
 
@@ -609,8 +622,16 @@ void ManageAllOrderTrailing()
             double gapSL  = ask + TrailGapUSD;
             double newSL  = NormalizePrice(MathMin(lockSL, gapSL));
 
-            if(oldSL == 0.0 || newSL < oldSL)
-               trade.PositionModify(ticket, newSL, oldTP);
+            double newTP = oldTP;
+            if(EnableTPTrailing)
+            {
+               double trailTP = NormalizePrice(ask - TPTrailGapUSD);
+               if(oldTP == 0.0 || trailTP < oldTP)
+                  newTP = trailTP;
+            }
+
+            if(oldSL == 0.0 || newSL < oldSL || newTP != oldTP)
+               trade.PositionModify(ticket, newSL, newTP);
          }
       }
    }
@@ -700,13 +721,13 @@ bool GetWorstFalconOrder(ulong &ticketOut, double &lossOut, int &typeOut, double
 }
 
 //+------------------------------------------------------------------+
-void ManageProfitBankClose()
+bool CloseWorstOrderByProfitBank()
 {
-   if(!EnableProfitBankClose) return;
-   if(TimeCurrent() - lastProfitBankCloseTime < ProfitBankCloseDelaySec) return;
+   if(!EnableManualProfitBankClose) return false;
+   if(TimeCurrent() - lastProfitBankCloseTime < ProfitBankCloseDelaySec) return false;
 
    double bank = GetClosedFalconNetProfit();
-   if(bank < MinProfitBankToUse) return;
+   if(bank < MinProfitBankToUse) return false;
 
    double usableBank = bank * ProfitBankUsePercent / 100.0;
 
@@ -715,22 +736,52 @@ void ManageProfitBankClose()
    int type;
    double lot;
 
-   if(!GetWorstFalconOrder(ticket, loss, type, lot)) return;
+   if(!GetWorstFalconOrder(ticket, loss, type, lot)) return false;
 
    double lossAbs = MathAbs(loss);
-   if(lossAbs > usableBank) return;
-   if(MaxSingleLossToClose > 0.0 && lossAbs > MaxSingleLossToClose) return;
+   if(lossAbs > usableBank) return false;
+   if(MaxSingleLossToClose > 0.0 && lossAbs > MaxSingleLossToClose) return false;
 
    if(trade.PositionClose(ticket))
    {
       lastProfitBankCloseTime = TimeCurrent();
-      Print("Profit Bank closed worst Falcon order. Ticket=", ticket,
+      Print("Manual Profit Bank button closed worst Falcon order. Ticket=", ticket,
             " Loss=", DoubleToString(loss, 2),
             " Bank=", DoubleToString(bank, 2),
             " Usable=", DoubleToString(usableBank, 2));
+      return true;
    }
+
+   return false;
 }
 
+//+------------------------------------------------------------------+
+void CreateDashboardButton()
+{
+   if(!EnableManualProfitBankClose)
+   {
+      ObjectDelete(0, BTN_CLOSE_WORST);
+      return;
+   }
+
+   if(ObjectFind(0, BTN_CLOSE_WORST) < 0)
+   {
+      ObjectCreate(0, BTN_CLOSE_WORST, OBJ_BUTTON, 0, 0, 0);
+      ObjectSetInteger(0, BTN_CLOSE_WORST, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
+      ObjectSetInteger(0, BTN_CLOSE_WORST, OBJPROP_XDISTANCE, 20);
+      ObjectSetInteger(0, BTN_CLOSE_WORST, OBJPROP_YDISTANCE, 25);
+      ObjectSetInteger(0, BTN_CLOSE_WORST, OBJPROP_XSIZE, 170);
+      ObjectSetInteger(0, BTN_CLOSE_WORST, OBJPROP_YSIZE, 28);
+      ObjectSetInteger(0, BTN_CLOSE_WORST, OBJPROP_FONTSIZE, 9);
+      ObjectSetInteger(0, BTN_CLOSE_WORST, OBJPROP_COLOR, clrWhite);
+      ObjectSetInteger(0, BTN_CLOSE_WORST, OBJPROP_BGCOLOR, clrFireBrick);
+      ObjectSetInteger(0, BTN_CLOSE_WORST, OBJPROP_BORDER_COLOR, clrWhite);
+   }
+
+   ObjectSetString(0, BTN_CLOSE_WORST, OBJPROP_TEXT, "Close Worst by Bank");
+}
+
+//+------------------------------------------------------------------+
 //+------------------------------------------------------------------+
 string GetStackingText(int type, int magic)
 {
@@ -846,7 +897,7 @@ void DrawDashboard()
    }
 
    string text =
-      "FALCON PROFIT ENGINE v3.21\n"
+      "FALCON PROFIT ENGINE v3.22\n"
       "--------------------------------\n"
       "Mode        : " + modeText + "\n"
       "BUY Status  : " + buyStatus + "\n"
@@ -861,7 +912,8 @@ void DrawDashboard()
       "L36-Max : " + DoubleToString(Lot_L36_Max, 2) + " lot | $" + DoubleToString(Spacing_36_50, 1) + " spacing\n\n"
       "TP/TRAIL\n"
       "Broker TP : $" + DoubleToString(OrderTP_USD, 2) + " on every order\n"
-      "Trail     : start $" + DoubleToString(TrailStartUSD, 2) + " | lock $" + DoubleToString(TrailLockUSD, 2) + " | gap $" + DoubleToString(TrailGapUSD, 2) + "\n\n"
+      "SL Trail  : start $" + DoubleToString(TrailStartUSD, 2) + " | lock $" + DoubleToString(TrailLockUSD, 2) + " | gap $" + DoubleToString(TrailGapUSD, 2) + "\n"
+      "TP Trail  : " + (EnableTPTrailing ? "ON | gap $" + DoubleToString(TPTrailGapUSD, 2) : "OFF") + "\n\n"
       "PROFIT BANK\n"
       "Bank      : " + DoubleToString(profitBank, 2) + " | Usable " + DoubleToString(usableBank, 2) + " (" + DoubleToString(ProfitBankUsePercent, 1) + "%)\n"
       "Worst     : " + worstText + "\n\n"
@@ -876,9 +928,35 @@ void DrawDashboard()
 }
 
 //+------------------------------------------------------------------+
+void OnChartEvent(const int id,
+                  const long &lparam,
+                  const double &dparam,
+                  const string &sparam)
+{
+   if(id == CHARTEVENT_OBJECT_CLICK && sparam == BTN_CLOSE_WORST)
+   {
+      bool closed = CloseWorstOrderByProfitBank();
+
+      if(!closed)
+         Print("Manual Profit Bank close skipped. Check bank, usable %, max loss, cooldown, or no losing Falcon order.");
+
+      ObjectSetInteger(0, BTN_CLOSE_WORST, OBJPROP_STATE, false);
+      ChartRedraw();
+   }
+}
+
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   ObjectDelete(0, BTN_CLOSE_WORST);
+}
+
+//+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
 int OnInit()
 {
-   Print("Falcon Profit Engine v3.21 initialized.");
+   Print("Falcon Profit Engine v3.22 initialized.");
+   CreateDashboardButton();
    return INIT_SUCCEEDED;
 }
 
@@ -888,7 +966,7 @@ void OnTick()
    CheckManualBaseStatus();
    ManageEntries();
    ManageAllOrderTrailing();
-   ManageProfitBankClose();
    DrawDashboard();
+   CreateDashboardButton();
 }
 //+------------------------------------------------------------------+
