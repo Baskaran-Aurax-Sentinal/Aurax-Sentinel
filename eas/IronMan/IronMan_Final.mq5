@@ -1,17 +1,17 @@
 //+------------------------------------------------------------------+
 //|                                                   IronMan.mq5    |
-//|                  Manual Trigger BTCUSD Hedge Grid + M15 Exit     |
+//|                  Manual Trigger BTCUSD Hedge Grid + M15 Exit - No Backfill     |
 //|                                                                  |
 //|  Logic:                                                          |
 //|  - Manual BUY or SELL on same symbol starts the cycle             |
 //|  - Base price = first detected manual order price                 |
-//|  - Every GridStepUSD movement from base level, open BUY + SELL    |
+//|  - No backfill: only fresh grid level opens BUY + SELL       |
 //|  - No duplicate pair in same grid level                           |
 //|  - M15 reversal candle patterns close matching side               |
 //|  - Broker-level TP at entry + optional individual trailing        |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.00"
+#property version   "1.10"
 #property description "IronMan - BTCUSD manual trigger hedge grid with M15 candle-pattern exits"
 
 #include <Trade/Trade.mqh>
@@ -53,6 +53,7 @@ input bool   ShowDashboard              = true;
 double   g_base_price       = 0.0;
 bool     g_cycle_active     = false;
 datetime g_last_pattern_bar = 0;
+int      g_last_executed_level = 0;
 
 //------------------------- Helpers ---------------------------------
 string SideText(const long type)
@@ -249,27 +250,34 @@ void ManageGridEntries()
       return;
 
    int curLevel = CurrentGridLevel();
+
+   // No trade inside base zone. Reset last level so next breakout from base can trade.
    if(curLevel == 0)
+   {
+      g_last_executed_level = 0;
+      return;
+   }
+
+   // v1.10 No Backfill:
+   // Open only when price enters one fresh grid level.
+   // Do NOT open all missed old levels at current market price.
+   if(curLevel == g_last_executed_level)
       return;
 
-   int opened = 0;
+   if(CountIronManPositions() + 2 > MaxEAPositions)
+      return;
 
-   if(curLevel > 0)
+   // Prevent duplicate pair at the same still-active level.
+   // After one side is closed by candle pattern, EA will still continue
+   // on the NEXT fresh grid level because curLevel will change.
+   if(LevelAlreadyTraded(curLevel))
    {
-      for(int lvl = 1; lvl <= curLevel && opened < MaxPairsPerTick; lvl++)
-      {
-         if(OpenBuySellPair(lvl))
-            opened++;
-      }
+      g_last_executed_level = curLevel;
+      return;
    }
-   else
-   {
-      for(int lvl = -1; lvl >= curLevel && opened < MaxPairsPerTick; lvl--)
-      {
-         if(OpenBuySellPair(lvl))
-            opened++;
-      }
-   }
+
+   if(OpenBuySellPair(curLevel))
+      g_last_executed_level = curLevel;
 }
 
 void ManageTrailing()
@@ -487,6 +495,7 @@ void Dashboard()
    text += "Manual Trigger Found: " + string(manualFound ? "YES" : "NO") + "\n";
    text += "Base Price: " + DoubleToString(g_base_price, _Digits) + "\n";
    text += "Current Grid Level: " + IntegerToString(CurrentGridLevel()) + "\n";
+   text += "Last Executed Level: " + IntegerToString(g_last_executed_level) + "\n";
    text += "Grid Step: $" + DoubleToString(GridStepUSD, 2) + "\n\n";
 
    text += "BUY Orders: " + IntegerToString(CountIronManPositions(POSITION_TYPE_BUY)) + "\n";
@@ -525,6 +534,7 @@ void OnTick()
       if(FindManualBase(manualBase))
       {
          g_base_price = manualBase;
+         g_last_executed_level = CurrentGridLevel(); // no backfill when cycle starts
          g_cycle_active = true;
          Print(InpEAName, ": cycle started from manual base price ", DoubleToString(g_base_price, _Digits));
       }
@@ -541,6 +551,7 @@ void OnTick()
       {
          g_cycle_active = false;
          g_base_price = 0.0;
+         g_last_executed_level = 0;
          Print(InpEAName, ": cycle reset. Waiting for next manual order.");
       }
    }
