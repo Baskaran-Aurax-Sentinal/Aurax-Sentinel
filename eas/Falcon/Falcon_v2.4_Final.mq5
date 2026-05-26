@@ -1,9 +1,9 @@
 //+------------------------------------------------------------------+
-//| Falcon Profit Engine v3.20                                       |
+//| Falcon Profit Engine v3.21                                       |
 //| Auto / Manual Trigger + Manual Base Stop + Hybrid Grid           |
 //+------------------------------------------------------------------+
 #property strict
-#property version "3.20"
+#property version "3.21"
 
 #include <Trade/Trade.mqh>
 CTrade trade;
@@ -20,7 +20,10 @@ input bool ManualBuyStartsCycle  = true;
 input bool ManualSellStartsCycle = true;
 
 //---------------- INPUTS ----------------//
-input double LotSize = 0.01;
+input double Lot_L1_10   = 0.01;
+input double Lot_L11_20  = 0.02;
+input double Lot_L21_35  = 0.03;
+input double Lot_L36_Max = 0.05;
 
 input int MagicNumberBuy  = 432515;
 input int MagicNumberSell = 532515;
@@ -40,22 +43,23 @@ input double Spacing_11_20  = 5.0;
 input double Spacing_21_35  = 8.0;
 input double Spacing_36_50  = 12.0;
 
-// 3 Layer TP
-input int Layer1Orders = 5;
-input int Layer2Orders = 20;
+// Unified TP + trailing for all EA orders
+input double OrderTP_USD     = 10.0;
+input double TrailStartUSD   = 2.0;
+input double TrailLockUSD    = 1.0;
+input double TrailGapUSD     = 2.0;
 
-// Layer 1 broker TP
-input double Layer1_TP_USD = 5.0;
+// Dashboard stacking analysis
+input double StackZoneUSD       = 5.0;
+input int    StackAlertOrders   = 5;
 
-// Layer 2 trailing
-input double TrailStartUSD = 5.0;
-input double TrailLockUSD  = 2.0;
-input double TrailGapUSD   = 3.0;
-
-// Layer 3 basket
-input double BasketTP_Money        = 150.0;
-input double BasketTrailStartMoney = 75.0;
-input double BasketTrailGapMoney   = 30.0;
+// Profit Bank worst-order close
+input bool   EnableProfitBankClose     = true;
+input int    ProfitBankLookbackDays    = 30;
+input double ProfitBankUsePercent      = 40.0;
+input double MinProfitBankToUse        = 5.0;
+input double MaxSingleLossToClose      = 100.0;
+input int    ProfitBankCloseDelaySec   = 60;
 
 input bool AllowBuy  = true;
 input bool AllowSell = true;
@@ -69,8 +73,7 @@ datetime lastSellEntryTime = 0;
 double buyAnchorPrice  = 0.0;
 double sellAnchorPrice = 0.0;
 
-double buyBasketPeak  = 0.0;
-double sellBasketPeak = 0.0;
+datetime lastProfitBankCloseTime = 0;
 
 ulong manualBuyBaseTicket  = 0;
 ulong manualSellBaseTicket = 0;
@@ -94,6 +97,15 @@ double GetSpacingByLayer(int layer)
    if(layer <= 20) return Spacing_11_20;
    if(layer <= 35) return Spacing_21_35;
    return Spacing_36_50;
+}
+
+//+------------------------------------------------------------------+
+double GetLotByLayer(int layer)
+{
+   if(layer <= 10) return Lot_L1_10;
+   if(layer <= 20) return Lot_L11_20;
+   if(layer <= 35) return Lot_L21_35;
+   return Lot_L36_Max;
 }
 
 //+------------------------------------------------------------------+
@@ -325,15 +337,13 @@ double GetSideProfit(int type, int magic)
 bool OpenBuy(int layer)
 {
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-
-   double tp = 0.0;
-   if(layer <= Layer1Orders)
-      tp = NormalizePrice(ask + Layer1_TP_USD);
+   double lot = GetLotByLayer(layer);
+   double tp  = NormalizePrice(ask + OrderTP_USD);
 
    trade.SetExpertMagicNumber(MagicNumberBuy);
 
    bool result = trade.Buy(
-      LotSize,
+      lot,
       _Symbol,
       ask,
       0.0,
@@ -351,15 +361,13 @@ bool OpenBuy(int layer)
 bool OpenSell(int layer)
 {
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-
-   double tp = 0.0;
-   if(layer <= Layer1Orders)
-      tp = NormalizePrice(bid - Layer1_TP_USD);
+   double lot = GetLotByLayer(layer);
+   double tp  = NormalizePrice(bid - OrderTP_USD);
 
    trade.SetExpertMagicNumber(MagicNumberSell);
 
    bool result = trade.Sell(
-      LotSize,
+      lot,
       _Symbol,
       bid,
       0.0,
@@ -553,7 +561,7 @@ void ManageEntries()
 }
 
 //+------------------------------------------------------------------+
-void ManageLayer2Trailing()
+void ManageAllOrderTrailing()
 {
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
@@ -572,13 +580,9 @@ void ManageLayer2Trailing()
       if(magic != MagicNumberBuy && magic != MagicNumberSell)
          continue;
 
-      int layer = GetLayerFromComment(PositionGetString(POSITION_COMMENT));
-
-      if(layer <= Layer1Orders || layer > Layer2Orders)
-         continue;
-
       double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
       double oldSL = PositionGetDouble(POSITION_SL);
+      double oldTP = PositionGetDouble(POSITION_TP);
 
       if(type == POSITION_TYPE_BUY)
       {
@@ -591,7 +595,7 @@ void ManageLayer2Trailing()
             double newSL  = NormalizePrice(MathMax(lockSL, gapSL));
 
             if(oldSL == 0.0 || newSL > oldSL)
-               trade.PositionModify(ticket, newSL, 0.0);
+               trade.PositionModify(ticket, newSL, oldTP);
          }
       }
 
@@ -606,7 +610,7 @@ void ManageLayer2Trailing()
             double newSL  = NormalizePrice(MathMin(lockSL, gapSL));
 
             if(oldSL == 0.0 || newSL < oldSL)
-               trade.PositionModify(ticket, newSL, 0.0);
+               trade.PositionModify(ticket, newSL, oldTP);
          }
       }
    }
@@ -630,69 +634,172 @@ void CloseSide(int type, int magic)
 }
 
 //+------------------------------------------------------------------+
-void ManageBasketTP()
+double GetClosedFalconNetProfit()
 {
-   int buyCount  = CountPositions(POSITION_TYPE_BUY, MagicNumberBuy);
-   int sellCount = CountPositions(POSITION_TYPE_SELL, MagicNumberSell);
+   double profit = 0.0;
+   datetime fromTime = TimeCurrent() - (ProfitBankLookbackDays * 86400);
 
-   double buyProfit  = GetSideProfit(POSITION_TYPE_BUY, MagicNumberBuy);
-   double sellProfit = GetSideProfit(POSITION_TYPE_SELL, MagicNumberSell);
+   if(!HistorySelect(fromTime, TimeCurrent()))
+      return 0.0;
 
-   if(buyCount > Layer2Orders)
+   int total = HistoryDealsTotal();
+   for(int i = 0; i < total; i++)
    {
-      if(buyProfit > buyBasketPeak)
-         buyBasketPeak = buyProfit;
+      ulong deal = HistoryDealGetTicket(i);
+      if(deal == 0) continue;
 
-      if(buyProfit >= BasketTP_Money)
-      {
-         CloseSide(POSITION_TYPE_BUY, MagicNumberBuy);
-         buyBasketPeak = 0.0;
-         buyAnchorPrice = 0.0;
-      }
-      else if(buyBasketPeak >= BasketTrailStartMoney &&
-              buyProfit <= buyBasketPeak - BasketTrailGapMoney &&
-              buyProfit > 0.0)
-      {
-         CloseSide(POSITION_TYPE_BUY, MagicNumberBuy);
-         buyBasketPeak = 0.0;
-         buyAnchorPrice = 0.0;
-      }
-   }
-   else
-   {
-      buyBasketPeak = 0.0;
+      if(HistoryDealGetString(deal, DEAL_SYMBOL) != _Symbol) continue;
+
+      int magic = (int)HistoryDealGetInteger(deal, DEAL_MAGIC);
+      if(magic != MagicNumberBuy && magic != MagicNumberSell) continue;
+
+      int entry = (int)HistoryDealGetInteger(deal, DEAL_ENTRY);
+      if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_INOUT && entry != DEAL_ENTRY_OUT_BY) continue;
+
+      profit += HistoryDealGetDouble(deal, DEAL_PROFIT)
+              + HistoryDealGetDouble(deal, DEAL_SWAP)
+              + HistoryDealGetDouble(deal, DEAL_COMMISSION);
    }
 
-   if(sellCount > Layer2Orders)
-   {
-      if(sellProfit > sellBasketPeak)
-         sellBasketPeak = sellProfit;
+   if(profit < 0.0)
+      profit = 0.0;
 
-      if(sellProfit >= BasketTP_Money)
+   return profit;
+}
+
+//+------------------------------------------------------------------+
+bool GetWorstFalconOrder(ulong &ticketOut, double &lossOut, int &typeOut, double &lotOut)
+{
+   ticketOut = 0;
+   lossOut = 0.0;
+   typeOut = -1;
+   lotOut = 0.0;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(!PositionSelectByTicket(ticket)) continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+
+      int magic = (int)PositionGetInteger(POSITION_MAGIC);
+      if(magic != MagicNumberBuy && magic != MagicNumberSell) continue;
+
+      double pl = PositionGetDouble(POSITION_PROFIT);
+      if(pl < lossOut)
       {
-         CloseSide(POSITION_TYPE_SELL, MagicNumberSell);
-         sellBasketPeak = 0.0;
-         sellAnchorPrice = 0.0;
-      }
-      else if(sellBasketPeak >= BasketTrailStartMoney &&
-              sellProfit <= sellBasketPeak - BasketTrailGapMoney &&
-              sellProfit > 0.0)
-      {
-         CloseSide(POSITION_TYPE_SELL, MagicNumberSell);
-         sellBasketPeak = 0.0;
-         sellAnchorPrice = 0.0;
+         lossOut = pl;
+         ticketOut = ticket;
+         typeOut = (int)PositionGetInteger(POSITION_TYPE);
+         lotOut = PositionGetDouble(POSITION_VOLUME);
       }
    }
-   else
+
+   return (ticketOut > 0 && lossOut < 0.0);
+}
+
+//+------------------------------------------------------------------+
+void ManageProfitBankClose()
+{
+   if(!EnableProfitBankClose) return;
+   if(TimeCurrent() - lastProfitBankCloseTime < ProfitBankCloseDelaySec) return;
+
+   double bank = GetClosedFalconNetProfit();
+   if(bank < MinProfitBankToUse) return;
+
+   double usableBank = bank * ProfitBankUsePercent / 100.0;
+
+   ulong ticket;
+   double loss;
+   int type;
+   double lot;
+
+   if(!GetWorstFalconOrder(ticket, loss, type, lot)) return;
+
+   double lossAbs = MathAbs(loss);
+   if(lossAbs > usableBank) return;
+   if(MaxSingleLossToClose > 0.0 && lossAbs > MaxSingleLossToClose) return;
+
+   if(trade.PositionClose(ticket))
    {
-      sellBasketPeak = 0.0;
+      lastProfitBankCloseTime = TimeCurrent();
+      Print("Profit Bank closed worst Falcon order. Ticket=", ticket,
+            " Loss=", DoubleToString(loss, 2),
+            " Bank=", DoubleToString(bank, 2),
+            " Usable=", DoubleToString(usableBank, 2));
+   }
+}
+
+//+------------------------------------------------------------------+
+string GetStackingText(int type, int magic)
+{
+   double minPrice = 0.0;
+   double maxPrice = 0.0;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(!PositionSelectByTicket(ticket)) continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if((int)PositionGetInteger(POSITION_MAGIC) != magic) continue;
+      if((int)PositionGetInteger(POSITION_TYPE) != type) continue;
+
+      double price = PositionGetDouble(POSITION_PRICE_OPEN);
+      if(minPrice == 0.0 || price < minPrice) minPrice = price;
+      if(maxPrice == 0.0 || price > maxPrice) maxPrice = price;
    }
 
-   if(buyCount == 0 && StartMode == AUTO_MODE)
-      buyAnchorPrice = 0.0;
+   if(minPrice == 0.0 || maxPrice == 0.0 || StackZoneUSD <= 0.0)
+      return "No open stack\n";
 
-   if(sellCount == 0 && StartMode == AUTO_MODE)
-      sellAnchorPrice = 0.0;
+   double startZone = MathFloor(minPrice / StackZoneUSD) * StackZoneUSD;
+   double endZone   = MathFloor(maxPrice / StackZoneUSD) * StackZoneUSD;
+
+   string txt = "";
+
+   for(double z = startZone; z <= endZone + 0.0001; z += StackZoneUSD)
+   {
+      int orders = 0;
+      double lots = 0.0;
+      double pl = 0.0;
+
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         ulong ticket = PositionGetTicket(i);
+         if(ticket == 0) continue;
+         if(!PositionSelectByTicket(ticket)) continue;
+
+         if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+         if((int)PositionGetInteger(POSITION_MAGIC) != magic) continue;
+         if((int)PositionGetInteger(POSITION_TYPE) != type) continue;
+
+         double price = PositionGetDouble(POSITION_PRICE_OPEN);
+         if(price >= z && price < z + StackZoneUSD)
+         {
+            orders++;
+            lots += PositionGetDouble(POSITION_VOLUME);
+            pl += PositionGetDouble(POSITION_PROFIT);
+         }
+      }
+
+      if(orders > 0)
+      {
+         txt += DoubleToString(z, _Digits) + " - " + DoubleToString(z + StackZoneUSD, _Digits)
+             + " : " + IntegerToString(orders)
+             + " | Lot " + DoubleToString(lots, 2)
+             + " | P/L " + DoubleToString(pl, 2);
+
+         if(orders >= StackAlertOrders)
+            txt += " <<< STACKED";
+
+         txt += "\n";
+      }
+   }
+
+   return txt;
 }
 
 //+------------------------------------------------------------------+
@@ -703,6 +810,14 @@ void DrawDashboard()
 
    double buyProfit  = GetSideProfit(POSITION_TYPE_BUY, MagicNumberBuy);
    double sellProfit = GetSideProfit(POSITION_TYPE_SELL, MagicNumberSell);
+   double profitBank = GetClosedFalconNetProfit();
+   double usableBank = profitBank * ProfitBankUsePercent / 100.0;
+
+   ulong worstTicket;
+   double worstLoss;
+   int worstType;
+   double worstLot;
+   bool hasWorst = GetWorstFalconOrder(worstTicket, worstLoss, worstType, worstLot);
 
    string modeText = "AUTO";
    if(StartMode == MANUAL_TRIGGER_MODE)
@@ -722,26 +837,40 @@ void DrawDashboard()
       else sellStatus = "MANUAL BASE ACTIVE";
    }
 
+   string worstText = "None";
+   if(hasWorst)
+   {
+      worstText = (worstType == POSITION_TYPE_BUY ? "BUY" : "SELL")
+                + " | Lot " + DoubleToString(worstLot, 2)
+                + " | Loss " + DoubleToString(worstLoss, 2);
+   }
+
    string text =
-      "FALCON PROFIT ENGINE v3.20\n"
+      "FALCON PROFIT ENGINE v3.21\n"
       "--------------------------------\n"
       "Mode        : " + modeText + "\n"
       "BUY Status  : " + buyStatus + "\n"
       "SELL Status : " + sellStatus + "\n\n"
-      "BUY Orders  : " + IntegerToString(buyCount) + " / " + IntegerToString(MaxBuyOrders) + "\n"
-      "SELL Orders : " + IntegerToString(sellCount) + " / " + IntegerToString(MaxSellOrders) + "\n"
+      "BUY Orders  : " + IntegerToString(buyCount) + " / " + IntegerToString(MaxBuyOrders) + " | P/L " + DoubleToString(buyProfit, 2) + "\n"
+      "SELL Orders : " + IntegerToString(sellCount) + " / " + IntegerToString(MaxSellOrders) + " | P/L " + DoubleToString(sellProfit, 2) + "\n"
       "TOTAL       : " + IntegerToString(buyCount + sellCount) + " / " + IntegerToString(MaxTotalOrders) + "\n\n"
-      "BUY Profit  : " + DoubleToString(buyProfit, 2) + "\n"
-      "SELL Profit : " + DoubleToString(sellProfit, 2) + "\n\n"
-      "BUY Peak    : " + DoubleToString(buyBasketPeak, 2) + "\n"
-      "SELL Peak   : " + DoubleToString(sellBasketPeak, 2) + "\n\n"
+      "LOT LADDER\n"
+      "L1-L10  : " + DoubleToString(Lot_L1_10, 2) + " lot | $" + DoubleToString(Spacing_1_10, 1) + " spacing | Exact refill\n"
+      "L11-L20 : " + DoubleToString(Lot_L11_20, 2) + " lot | $" + DoubleToString(Spacing_11_20, 1) + " spacing\n"
+      "L21-L35 : " + DoubleToString(Lot_L21_35, 2) + " lot | $" + DoubleToString(Spacing_21_35, 1) + " spacing\n"
+      "L36-Max : " + DoubleToString(Lot_L36_Max, 2) + " lot | $" + DoubleToString(Spacing_36_50, 1) + " spacing\n\n"
+      "TP/TRAIL\n"
+      "Broker TP : $" + DoubleToString(OrderTP_USD, 2) + " on every order\n"
+      "Trail     : start $" + DoubleToString(TrailStartUSD, 2) + " | lock $" + DoubleToString(TrailLockUSD, 2) + " | gap $" + DoubleToString(TrailGapUSD, 2) + "\n\n"
+      "PROFIT BANK\n"
+      "Bank      : " + DoubleToString(profitBank, 2) + " | Usable " + DoubleToString(usableBank, 2) + " (" + DoubleToString(ProfitBankUsePercent, 1) + "%)\n"
+      "Worst     : " + worstText + "\n\n"
+      "STACKING ANALYSIS BUY\n"
+      + GetStackingText(POSITION_TYPE_BUY, MagicNumberBuy) + "\n"
+      "STACKING ANALYSIS SELL\n"
+      + GetStackingText(POSITION_TYPE_SELL, MagicNumberSell) + "\n"
       "BUY Anchor  : " + DoubleToString(buyAnchorPrice, _Digits) + "\n"
-      "SELL Anchor : " + DoubleToString(sellAnchorPrice, _Digits) + "\n\n"
-      "L1-L10      : Exact Refill\n"
-      "L11-L50     : Dynamic Spacing\n"
-      "Layer 1     : Broker TP\n"
-      "Layer 2     : Trail SL\n"
-      "Layer 3     : Basket TP / Trail";
+      "SELL Anchor : " + DoubleToString(sellAnchorPrice, _Digits);
 
    Comment(text);
 }
@@ -749,7 +878,7 @@ void DrawDashboard()
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   Print("Falcon Profit Engine v3.20 initialized.");
+   Print("Falcon Profit Engine v3.21 initialized.");
    return INIT_SUCCEEDED;
 }
 
@@ -758,8 +887,8 @@ void OnTick()
 {
    CheckManualBaseStatus();
    ManageEntries();
-   ManageLayer2Trailing();
-   ManageBasketTP();
+   ManageAllOrderTrailing();
+   ManageProfitBankClose();
    DrawDashboard();
 }
 //+------------------------------------------------------------------+
