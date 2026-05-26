@@ -1,9 +1,9 @@
 //+------------------------------------------------------------------+
-//| Falcon Profit Engine v3.22                                       |
+//| Falcon Profit Engine v3.23                                       |
 //| Auto / Manual Trigger + Manual Base Stop + Hybrid Grid           |
 //+------------------------------------------------------------------+
 #property strict
-#property version "3.22"
+#property version "3.23"
 
 #include <Trade/Trade.mqh>
 CTrade trade;
@@ -11,13 +11,12 @@ CTrade trade;
 //---------------- MODE ----------------//
 enum StartModeEnum
 {
-   AUTO_MODE = 0,
-   MANUAL_TRIGGER_MODE = 1
+   AUTO_BUY_SELL_MODE = 0,        // Auto mode both BUY & SELL
+   AUTO_BUY_MANUAL_SELL_MODE = 1, // BUY auto, SELL starts only from manual base
+   BOTH_MANUAL_MODE = 2           // BUY and SELL both start only from manual base
 };
 
-input StartModeEnum StartMode = AUTO_MODE;
-input bool ManualBuyStartsCycle  = true;
-input bool ManualSellStartsCycle = true;
+input StartModeEnum StartMode = AUTO_BUY_SELL_MODE;
 
 //---------------- INPUTS ----------------//
 input double Lot_L1_10   = 0.01;
@@ -88,6 +87,31 @@ bool sellCycleStartedByManual = false;
 
 bool buyManageOnly  = false;
 bool sellManageOnly = false;
+
+
+//+------------------------------------------------------------------+
+bool BuyIsAuto()
+{
+   return (StartMode == AUTO_BUY_SELL_MODE || StartMode == AUTO_BUY_MANUAL_SELL_MODE);
+}
+
+//+------------------------------------------------------------------+
+bool SellIsAuto()
+{
+   return (StartMode == AUTO_BUY_SELL_MODE);
+}
+
+//+------------------------------------------------------------------+
+bool BuyIsManual()
+{
+   return (StartMode == BOTH_MANUAL_MODE);
+}
+
+//+------------------------------------------------------------------+
+bool SellIsManual()
+{
+   return (StartMode == AUTO_BUY_MANUAL_SELL_MODE || StartMode == BOTH_MANUAL_MODE);
+}
 
 //+------------------------------------------------------------------+
 double NormalizePrice(double price)
@@ -189,9 +213,9 @@ void CheckManualBaseStatus()
    int buyCount  = CountPositions(POSITION_TYPE_BUY, MagicNumberBuy);
    int sellCount = CountPositions(POSITION_TYPE_SELL, MagicNumberSell);
 
-   if(StartMode == MANUAL_TRIGGER_MODE)
+   if(BuyIsManual() || SellIsManual())
    {
-      if(buyCycleStartedByManual && !buyManageOnly)
+      if(BuyIsManual() && buyCycleStartedByManual && !buyManageOnly)
       {
          if(!PositionTicketExists(manualBuyBaseTicket))
          {
@@ -200,7 +224,7 @@ void CheckManualBaseStatus()
          }
       }
 
-      if(sellCycleStartedByManual && !sellManageOnly)
+      if(SellIsManual() && sellCycleStartedByManual && !sellManageOnly)
       {
          if(!PositionTicketExists(manualSellBaseTicket))
          {
@@ -210,7 +234,7 @@ void CheckManualBaseStatus()
       }
 
       // Reset only after EA positions are fully gone
-      if(buyManageOnly && buyCount == 0)
+      if(BuyIsManual() && buyManageOnly && buyCount == 0)
       {
          buyManageOnly = false;
          buyCycleStartedByManual = false;
@@ -218,7 +242,7 @@ void CheckManualBaseStatus()
          buyAnchorPrice = 0.0;
       }
 
-      if(sellManageOnly && sellCount == 0)
+      if(SellIsManual() && sellManageOnly && sellCount == 0)
       {
          sellManageOnly = false;
          sellCycleStartedByManual = false;
@@ -404,14 +428,14 @@ void ManageBuyEntries()
 
    if(buyCount == 0)
    {
-      if(StartMode == AUTO_MODE)
+      if(BuyIsAuto())
       {
          buyAnchorPrice = ask;
          OpenBuy(1);
          return;
       }
 
-      if(StartMode == MANUAL_TRIGGER_MODE && ManualBuyStartsCycle)
+      if(BuyIsManual())
       {
          ulong manualTicket;
          double manualPrice;
@@ -430,7 +454,7 @@ void ManageBuyEntries()
       return;
    }
 
-   if(StartMode == MANUAL_TRIGGER_MODE && buyCycleStartedByManual && manualBuyBaseTicket > 0)
+   if(BuyIsManual() && buyCycleStartedByManual && manualBuyBaseTicket > 0)
    {
       if(!PositionTicketExists(manualBuyBaseTicket))
       {
@@ -490,14 +514,14 @@ void ManageSellEntries()
 
    if(sellCount == 0)
    {
-      if(StartMode == AUTO_MODE)
+      if(SellIsAuto())
       {
          sellAnchorPrice = bid;
          OpenSell(1);
          return;
       }
 
-      if(StartMode == MANUAL_TRIGGER_MODE && ManualSellStartsCycle)
+      if(SellIsManual())
       {
          ulong manualTicket;
          double manualPrice;
@@ -516,7 +540,7 @@ void ManageSellEntries()
       return;
    }
 
-   if(StartMode == MANUAL_TRIGGER_MODE && sellCycleStartedByManual && manualSellBaseTicket > 0)
+   if(SellIsManual() && sellCycleStartedByManual && manualSellBaseTicket > 0)
    {
       if(!PositionTicketExists(manualSellBaseTicket))
       {
@@ -870,19 +894,24 @@ void DrawDashboard()
    double worstLot;
    bool hasWorst = GetWorstFalconOrder(worstTicket, worstLoss, worstType, worstLot);
 
-   string modeText = "AUTO";
-   if(StartMode == MANUAL_TRIGGER_MODE)
-      modeText = "MANUAL TRIGGER";
+   string modeText = "AUTO BUY + AUTO SELL";
+   if(StartMode == AUTO_BUY_MANUAL_SELL_MODE)
+      modeText = "AUTO BUY + MANUAL SELL";
+   else if(StartMode == BOTH_MANUAL_MODE)
+      modeText = "BOTH MANUAL";
 
-   string buyStatus = "ACTIVE";
-   string sellStatus = "ACTIVE";
+   string buyStatus = BuyIsAuto() ? "AUTO ACTIVE" : "WAITING MANUAL BUY";
+   string sellStatus = SellIsAuto() ? "AUTO ACTIVE" : "WAITING MANUAL SELL";
 
-   if(StartMode == MANUAL_TRIGGER_MODE)
+   if(BuyIsManual())
    {
       if(!buyCycleStartedByManual) buyStatus = "WAITING MANUAL BUY";
       else if(buyManageOnly) buyStatus = "MANAGE ONLY";
       else buyStatus = "MANUAL BASE ACTIVE";
+   }
 
+   if(SellIsManual())
+   {
       if(!sellCycleStartedByManual) sellStatus = "WAITING MANUAL SELL";
       else if(sellManageOnly) sellStatus = "MANAGE ONLY";
       else sellStatus = "MANUAL BASE ACTIVE";
@@ -955,7 +984,7 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   Print("Falcon Profit Engine v3.22 initialized.");
+   Print("Falcon Profit Engine v3.23 initialized.");
    CreateDashboardButton();
    return INIT_SUCCEEDED;
 }
