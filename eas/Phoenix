@@ -1,0 +1,645 @@
+//+------------------------------------------------------------------+
+//| Phoenix_EA_v1.mq5                                                |
+//| Phoenix Phase 1 - Dynamic BUY Grid + Tactical SELL + Hedge Bias   |
+//| Built from agreed Phoenix architecture                            |
+//+------------------------------------------------------------------+
+#property strict
+#property version   "1.00"
+#property description "Phoenix V1: Auto BUY grid, tactical SELL confirmations, hedge imbalance, dashboard"
+
+#include <Trade/Trade.mqh>
+CTrade trade;
+
+//------------------------- INPUTS ----------------------------------
+input string EA_Name                    = "Phoenix_EA_v1";
+input ulong  MagicNumber                = 2026052801;
+input double BaseLot                    = 0.01;
+input bool   UseBrokerTP                = true;
+input double BuyTP_USD                  = 5.0;
+input double SellTP_USD                 = 3.0;
+input double HedgeTP_USD                = 3.0;
+
+// Trailing stop - money based per position
+input bool   EnableTrailing             = true;
+input double BuyTrailStart_USD          = 2.0;
+input double BuyTrailLock_USD           = 1.0;
+input double BuyTrailGap_USD            = 1.0;
+input double SellTrailStart_USD         = 2.0;
+input double SellTrailLock_USD          = 1.0;
+input double SellTrailGap_USD           = 1.0;
+input double HedgeTrailStart_USD        = 2.0;
+input double HedgeTrailLock_USD         = 1.0;
+input double HedgeTrailGap_USD          = 1.0;
+
+// BUY grid dynamic spacing
+input bool   EnableBuyGrid              = true;
+input int    BuyCooldownSeconds         = 20;
+input double Spacing_L1_15_USD          = 1.0;
+input double Spacing_L16_30_USD         = 2.0;
+input double Spacing_L31_50_USD         = 5.0;
+input double Spacing_L50Plus_USD        = 10.0;
+input int    MaxBuyOrders               = 250;
+input double LevelLockTolerance_USD     = 0.25;
+
+// SELL tactical module
+input bool   EnableAutoSellModule       = true;
+input int    MaxNegativeSellOrders      = 5;
+input int    SellCooldownSeconds        = 900;
+input double BottomBlockPercent24H      = 20.0; // no sell inside bottom x% of 24h range
+input double TopBlockPercent24H         = 20.0; // no buy hedge inside top x% of 24h range
+input int    EMAFastPeriod              = 20;
+input int    EMASlowPeriod              = 50;
+input bool   RequireM15Bearish          = true;
+input bool   RequireM5Bearish           = true;
+
+// Hedge imbalance module
+input bool   EnableHedgeEngine          = true;
+input double ImbalanceLotStep           = 0.03;
+input double MaxHedgeLots               = 0.30;
+input int    HedgeCooldownSeconds       = 600;
+input double MinDDForHedge_USD          = 100.0;
+
+// Profit bank / reduction placeholder V1
+input bool   EnableProfitBank           = true;
+input double ProfitBankUsePercent       = 30.0;
+
+// Safety
+input double SoftLockDD_USD             = 0.0;   // 0 = disabled. Example 1000 stops new entries
+input double HardLockDD_USD             = 0.0;   // 0 = disabled. Example 2000 stops all entries
+input double MaxTotalLots               = 5.0;
+input int    SlippagePoints             = 30;
+
+// Dashboard
+input bool   ShowDashboard              = true;
+input int    DashboardCorner            = CORNER_LEFT_UPPER;
+input int    DashboardX                 = 10;
+input int    DashboardY                 = 20;
+
+//------------------------- GLOBALS ---------------------------------
+datetime g_lastBuyTime   = 0;
+datetime g_lastSellTime  = 0;
+datetime g_lastHedgeTime = 0;
+double   g_profitBank    = 0.0;
+string   DASH_PREFIX     = "PX_DASH_";
+
+//------------------------- HELPERS ---------------------------------
+double NormalizeLots(double lots)
+{
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double step   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   lots = MathMax(minLot, MathMin(maxLot, lots));
+   if(step > 0.0) lots = MathFloor(lots / step) * step;
+   return NormalizeDouble(lots, 2);
+}
+
+double PriceNormalize(double price)
+{
+   return NormalizeDouble(price, (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
+}
+
+double TickValuePerLot()
+{
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tickSize <= 0.0) return 0.0;
+   return tickValue / tickSize;
+}
+
+double TPPrice(ENUM_ORDER_TYPE type, double entry, double lot, double targetMoney)
+{
+   if(!UseBrokerTP || targetMoney <= 0.0 || lot <= 0.0) return 0.0;
+   double moneyPerPriceUnit = TickValuePerLot() * lot;
+   if(moneyPerPriceUnit <= 0.0) return 0.0;
+   double dist = targetMoney / moneyPerPriceUnit;
+   if(type == ORDER_TYPE_BUY)  return PriceNormalize(entry + dist);
+   if(type == ORDER_TYPE_SELL) return PriceNormalize(entry - dist);
+   return 0.0;
+}
+
+
+double MoneyToPriceDistance(double lot, double money)
+{
+   if(lot <= 0.0 || money <= 0.0) return 0.0;
+   double moneyPerPriceUnit = TickValuePerLot() * lot;
+   if(moneyPerPriceUnit <= 0.0) return 0.0;
+   return money / moneyPerPriceUnit;
+}
+
+void GetTrailInputs(string comment, long posType, double &startMoney, double &lockMoney, double &gapMoney)
+{
+   bool hedge = (StringFind(comment, "PX_HEDGE") >= 0);
+   if(hedge)
+   {
+      startMoney = HedgeTrailStart_USD;
+      lockMoney  = HedgeTrailLock_USD;
+      gapMoney   = HedgeTrailGap_USD;
+      return;
+   }
+
+   if(posType == POSITION_TYPE_BUY)
+   {
+      startMoney = BuyTrailStart_USD;
+      lockMoney  = BuyTrailLock_USD;
+      gapMoney   = BuyTrailGap_USD;
+   }
+   else
+   {
+      startMoney = SellTrailStart_USD;
+      lockMoney  = SellTrailLock_USD;
+      gapMoney   = SellTrailGap_USD;
+   }
+}
+
+void ManageTrailingStops()
+{
+   if(!EnableTrailing) return;
+
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   int stopsLevel = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minStopDist = stopsLevel * _Point;
+
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(SlippagePoints);
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
+      if(!IsOurPosition()) continue;
+
+      long type       = PositionGetInteger(POSITION_TYPE);
+      double lot      = PositionGetDouble(POSITION_VOLUME);
+      double open     = PositionGetDouble(POSITION_PRICE_OPEN);
+      double curSL    = PositionGetDouble(POSITION_SL);
+      double curTP    = PositionGetDouble(POSITION_TP);
+      string comment  = PositionGetString(POSITION_COMMENT);
+
+      double startMoney, lockMoney, gapMoney;
+      GetTrailInputs(comment, type, startMoney, lockMoney, gapMoney);
+      if(startMoney <= 0.0 || gapMoney <= 0.0) continue;
+
+      double startDist = MoneyToPriceDistance(lot, startMoney);
+      double lockDist  = MoneyToPriceDistance(lot, lockMoney);
+      double gapDist   = MoneyToPriceDistance(lot, gapMoney);
+      if(startDist <= 0.0 || gapDist <= 0.0) continue;
+
+      if(type == POSITION_TYPE_BUY)
+      {
+         if((bid - open) < startDist) continue;
+         double lockSL  = open + lockDist;
+         double trailSL = bid - gapDist;
+         double newSL   = PriceNormalize(MathMax(lockSL, trailSL));
+
+         if(minStopDist > 0.0 && (bid - newSL) < minStopDist) continue;
+         if(curSL == 0.0 || newSL > curSL + (_Point * 2))
+            trade.PositionModify(ticket, newSL, curTP);
+      }
+      else if(type == POSITION_TYPE_SELL)
+      {
+         if((open - ask) < startDist) continue;
+         double lockSL  = open - lockDist;
+         double trailSL = ask + gapDist;
+         double newSL   = PriceNormalize(MathMin(lockSL, trailSL));
+
+         if(minStopDist > 0.0 && (newSL - ask) < minStopDist) continue;
+         if(curSL == 0.0 || newSL < curSL - (_Point * 2))
+            trade.PositionModify(ticket, newSL, curTP);
+      }
+   }
+}
+
+bool IsOurPosition()
+{
+   return (PositionGetString(POSITION_SYMBOL) == _Symbol && (ulong)PositionGetInteger(POSITION_MAGIC) == MagicNumber);
+}
+
+bool CommentContains(string key)
+{
+   string c = PositionGetString(POSITION_COMMENT);
+   return (StringFind(c, key) >= 0);
+}
+
+void CountExposure(int &buyCount, int &sellCount, double &buyLots, double &sellLots, double &buyPL, double &sellPL, int &negSellCount)
+{
+   buyCount = sellCount = negSellCount = 0;
+   buyLots = sellLots = buyPL = sellPL = 0.0;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
+      if(!IsOurPosition()) continue;
+
+      long type = PositionGetInteger(POSITION_TYPE);
+      double lot = PositionGetDouble(POSITION_VOLUME);
+      double pl  = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+
+      if(type == POSITION_TYPE_BUY)
+      {
+         buyCount++;
+         buyLots += lot;
+         buyPL += pl;
+      }
+      else if(type == POSITION_TYPE_SELL)
+      {
+         sellCount++;
+         sellLots += lot;
+         sellPL += pl;
+         if(pl < 0.0) negSellCount++;
+      }
+   }
+}
+
+double CurrentFloatingDD()
+{
+   int bc, sc, ns;
+   double bl, sl, bp, sp;
+   CountExposure(bc, sc, bl, sl, bp, sp, ns);
+   double total = bp + sp;
+   return (total < 0.0 ? -total : 0.0);
+}
+
+double CurrentTotalLots()
+{
+   int bc, sc, ns;
+   double bl, sl, bp, sp;
+   CountExposure(bc, sc, bl, sl, bp, sp, ns);
+   return bl + sl;
+}
+
+bool EntriesLocked()
+{
+   double dd = CurrentFloatingDD();
+   if(HardLockDD_USD > 0.0 && dd >= HardLockDD_USD) return true;
+   if(SoftLockDD_USD > 0.0 && dd >= SoftLockDD_USD) return true;
+   if(CurrentTotalLots() >= MaxTotalLots) return true;
+   return false;
+}
+
+//---------------------- 24H RANGE ----------------------------------
+bool Get24HRange(double &hi, double &lo)
+{
+   hi = -DBL_MAX;
+   lo = DBL_MAX;
+   datetime from = TimeCurrent() - 24 * 60 * 60;
+   MqlRates rates[];
+   int copied = CopyRates(_Symbol, PERIOD_M15, from, TimeCurrent(), rates);
+   if(copied <= 0) return false;
+   for(int i = 0; i < copied; i++)
+   {
+      hi = MathMax(hi, rates[i].high);
+      lo = MathMin(lo, rates[i].low);
+   }
+   return (hi > lo && hi > 0 && lo > 0);
+}
+
+bool IsInBottom24HZone()
+{
+   double hi, lo;
+   if(!Get24HRange(hi, lo)) return false;
+   double range = hi - lo;
+   double limit = lo + range * BottomBlockPercent24H / 100.0;
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   return (bid <= limit);
+}
+
+bool IsInTop24HZone()
+{
+   double hi, lo;
+   if(!Get24HRange(hi, lo)) return false;
+   double range = hi - lo;
+   double limit = hi - range * TopBlockPercent24H / 100.0;
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   return (ask >= limit);
+}
+
+//---------------------- TREND / CONFIRMATION -----------------------
+double EMAValue(ENUM_TIMEFRAMES tf, int period, int shift)
+{
+   int handle = iMA(_Symbol, tf, period, 0, MODE_EMA, PRICE_CLOSE);
+   if(handle == INVALID_HANDLE) return 0.0;
+   double buf[];
+   ArraySetAsSeries(buf, true);
+   int copied = CopyBuffer(handle, 0, shift, 1, buf);
+   IndicatorRelease(handle);
+   if(copied <= 0) return 0.0;
+   return buf[0];
+}
+
+bool BearishCandle(ENUM_TIMEFRAMES tf, int shift = 1)
+{
+   MqlRates r[];
+   ArraySetAsSeries(r, true);
+   if(CopyRates(_Symbol, tf, 0, shift + 2, r) <= shift) return false;
+   return (r[shift].close < r[shift].open);
+}
+
+bool BullishTrendM15()
+{
+   double fast = EMAValue(PERIOD_M15, EMAFastPeriod, 1);
+   double slow = EMAValue(PERIOD_M15, EMASlowPeriod, 1);
+   return (fast > 0 && slow > 0 && fast > slow);
+}
+
+bool BearishTrendM15()
+{
+   double fast = EMAValue(PERIOD_M15, EMAFastPeriod, 1);
+   double slow = EMAValue(PERIOD_M15, EMASlowPeriod, 1);
+   return (fast > 0 && slow > 0 && fast < slow);
+}
+
+bool SellConfirmationOK()
+{
+   if(IsInBottom24HZone()) return false;
+   if(RequireM15Bearish)
+   {
+      if(!BearishTrendM15() && !BearishCandle(PERIOD_M15, 1)) return false;
+   }
+   if(RequireM5Bearish)
+   {
+      if(!BearishCandle(PERIOD_M5, 1)) return false;
+   }
+   return true;
+}
+
+//---------------------- BUY GRID -----------------------------------
+double DynamicSpacingByBuyCount(int buyCount)
+{
+   int nextLevel = buyCount + 1;
+   if(nextLevel <= 15) return Spacing_L1_15_USD;
+   if(nextLevel <= 30) return Spacing_L16_30_USD;
+   if(nextLevel <= 50) return Spacing_L31_50_USD;
+   return Spacing_L50Plus_USD;
+}
+
+bool HasBuyNearPrice(double price, double tolerance)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
+      if(!IsOurPosition()) continue;
+      if(PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY) continue;
+      double p = PositionGetDouble(POSITION_PRICE_OPEN);
+      if(MathAbs(p - price) <= tolerance) return true;
+   }
+   return false;
+}
+
+bool GetBuyExtremes(double &lowestBuy, double &highestBuy)
+{
+   lowestBuy = DBL_MAX;
+   highestBuy = -DBL_MAX;
+   bool found = false;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
+      if(!IsOurPosition()) continue;
+      if(PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY) continue;
+      double p = PositionGetDouble(POSITION_PRICE_OPEN);
+      lowestBuy = MathMin(lowestBuy, p);
+      highestBuy = MathMax(highestBuy, p);
+      found = true;
+   }
+   return found;
+}
+
+bool OpenBuy(string comment)
+{
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double lot = NormalizeLots(BaseLot);
+   double tp = TPPrice(ORDER_TYPE_BUY, ask, lot, BuyTP_USD);
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(SlippagePoints);
+   bool ok = trade.Buy(lot, _Symbol, ask, 0.0, tp, comment);
+   if(ok) g_lastBuyTime = TimeCurrent();
+   return ok;
+}
+
+void ManageBuyGrid()
+{
+   if(!EnableBuyGrid || EntriesLocked()) return;
+   if(TimeCurrent() - g_lastBuyTime < BuyCooldownSeconds) return;
+
+   int bc, sc, ns;
+   double bl, sl, bp, sp;
+   CountExposure(bc, sc, bl, sl, bp, sp, ns);
+   if(bc >= MaxBuyOrders) return;
+
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double lowest, highest;
+   if(!GetBuyExtremes(lowest, highest))
+   {
+      OpenBuy("PX_BUY_L1");
+      return;
+   }
+
+   double spacing = DynamicSpacingByBuyCount(bc);
+
+   // Strict either-side spacing: add only if current price is outside buy envelope by spacing.
+   if(bid <= lowest - spacing || bid >= highest + spacing)
+   {
+      if(!HasBuyNearPrice(bid, LevelLockTolerance_USD))
+      {
+         string c = "PX_BUY_L" + IntegerToString(bc + 1);
+         OpenBuy(c);
+      }
+   }
+}
+
+//---------------------- SELL MODULE --------------------------------
+bool OpenSell(string comment, double lotMult = 1.0)
+{
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double lot = NormalizeLots(BaseLot * lotMult);
+   double tp = TPPrice(ORDER_TYPE_SELL, bid, lot, SellTP_USD);
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(SlippagePoints);
+   bool ok = trade.Sell(lot, _Symbol, bid, 0.0, tp, comment);
+   if(ok) g_lastSellTime = TimeCurrent();
+   return ok;
+}
+
+void ManageSellModule()
+{
+   if(!EnableAutoSellModule || EntriesLocked()) return;
+   if(TimeCurrent() - g_lastSellTime < SellCooldownSeconds) return;
+
+   int bc, sc, ns;
+   double bl, sl, bp, sp;
+   CountExposure(bc, sc, bl, sl, bp, sp, ns);
+   if(ns >= MaxNegativeSellOrders) return;
+   if(!SellConfirmationOK()) return;
+
+   // Tactical sell only, not grid. One entry per cooldown.
+   OpenSell("PX_SELL_AUTO", 1.0);
+}
+
+//---------------------- HEDGE ENGINE -------------------------------
+bool OpenHedgeBuy(double lot)
+{
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   lot = NormalizeLots(lot);
+   double tp = TPPrice(ORDER_TYPE_BUY, ask, lot, HedgeTP_USD);
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(SlippagePoints);
+   bool ok = trade.Buy(lot, _Symbol, ask, 0.0, tp, "PX_HEDGE_BUY");
+   if(ok) g_lastHedgeTime = TimeCurrent();
+   return ok;
+}
+
+bool OpenHedgeSell(double lot)
+{
+   if(IsInBottom24HZone()) return false;
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   lot = NormalizeLots(lot);
+   double tp = TPPrice(ORDER_TYPE_SELL, bid, lot, HedgeTP_USD);
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(SlippagePoints);
+   bool ok = trade.Sell(lot, _Symbol, bid, 0.0, tp, "PX_HEDGE_SELL");
+   if(ok) g_lastHedgeTime = TimeCurrent();
+   return ok;
+}
+
+void ManageHedgeEngine()
+{
+   if(!EnableHedgeEngine || EntriesLocked()) return;
+   if(TimeCurrent() - g_lastHedgeTime < HedgeCooldownSeconds) return;
+   if(CurrentFloatingDD() < MinDDForHedge_USD) return;
+
+   int bc, sc, ns;
+   double bl, sl, bp, sp;
+   CountExposure(bc, sc, bl, sl, bp, sp, ns);
+
+   double hedgeLot = MathMin(ImbalanceLotStep, MaxHedgeLots);
+
+   // If bullish: add BUY pressure when sell lots dominate, but avoid buying at 24h top.
+   if(BullishTrendM15())
+   {
+      if(sl > bl && !IsInTop24HZone())
+         OpenHedgeBuy(hedgeLot);
+      return;
+   }
+
+   // If bearish: add SELL pressure when buy lots dominate, but no bottom sells.
+   if(BearishTrendM15())
+   {
+      if(bl > sl && !IsInBottom24HZone())
+         OpenHedgeSell(hedgeLot);
+      return;
+   }
+}
+
+//---------------------- PROFIT BANK --------------------------------
+void UpdateProfitBankFromHistory()
+{
+   if(!EnableProfitBank) return;
+   // V1: calculate today's realized profit for this EA and show 30% usable.
+   datetime dayStart = iTime(_Symbol, PERIOD_D1, 0);
+   if(!HistorySelect(dayStart, TimeCurrent())) return;
+   double profit = 0.0;
+   int deals = HistoryDealsTotal();
+   for(int i = 0; i < deals; i++)
+   {
+      ulong d = HistoryDealGetTicket(i);
+      if(d == 0) continue;
+      if(HistoryDealGetString(d, DEAL_SYMBOL) != _Symbol) continue;
+      if((ulong)HistoryDealGetInteger(d, DEAL_MAGIC) != MagicNumber) continue;
+      long entry = HistoryDealGetInteger(d, DEAL_ENTRY);
+      if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_INOUT) continue;
+      profit += HistoryDealGetDouble(d, DEAL_PROFIT) + HistoryDealGetDouble(d, DEAL_SWAP) + HistoryDealGetDouble(d, DEAL_COMMISSION);
+   }
+   g_profitBank = profit;
+}
+
+//---------------------- DASHBOARD ----------------------------------
+void Label(string name, string text, int x, int y, color clr = clrWhite, int size = 9)
+{
+   string obj = DASH_PREFIX + name;
+   if(ObjectFind(0, obj) < 0)
+   {
+      ObjectCreate(0, obj, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, obj, OBJPROP_CORNER, DashboardCorner);
+      ObjectSetInteger(0, obj, OBJPROP_XDISTANCE, x);
+      ObjectSetInteger(0, obj, OBJPROP_YDISTANCE, y);
+      ObjectSetInteger(0, obj, OBJPROP_FONTSIZE, size);
+      ObjectSetString(0, obj, OBJPROP_FONT, "Consolas");
+   }
+   ObjectSetString(0, obj, OBJPROP_TEXT, text);
+   ObjectSetInteger(0, obj, OBJPROP_COLOR, clr);
+}
+
+void ClearDashboard()
+{
+   int total = ObjectsTotal(0, 0, -1);
+   for(int i = total - 1; i >= 0; i--)
+   {
+      string name = ObjectName(0, i, 0, -1);
+      if(StringFind(name, DASH_PREFIX) == 0) ObjectDelete(0, name);
+   }
+}
+
+void DrawDashboard()
+{
+   if(!ShowDashboard) return;
+
+   int bc, sc, ns;
+   double bl, sl, bp, sp;
+   CountExposure(bc, sc, bl, sl, bp, sp, ns);
+   double hi = 0, lo = 0;
+   Get24HRange(hi, lo);
+   double range = hi - lo;
+   double bottomLimit = lo + range * BottomBlockPercent24H / 100.0;
+   double topLimit = hi - range * TopBlockPercent24H / 100.0;
+   string m15 = BullishTrendM15() ? "BULLISH" : (BearishTrendM15() ? "BEARISH" : "NEUTRAL");
+   string sellAllowed = SellConfirmationOK() ? "YES" : "NO";
+   string lock = EntriesLocked() ? "LOCKED" : "ACTIVE";
+   double usableBank = g_profitBank * ProfitBankUsePercent / 100.0;
+
+   int y = DashboardY;
+   int x = DashboardX;
+   Label("01", "PHOENIX EA v1  |  " + _Symbol + "  |  " + lock, x, y, clrAqua, 10); y += 16;
+   Label("02", "BUY:  orders=" + IntegerToString(bc) + " lots=" + DoubleToString(bl,2) + " PL=" + DoubleToString(bp,2), x, y, clrLime); y += 14;
+   Label("03", "SELL: orders=" + IntegerToString(sc) + " lots=" + DoubleToString(sl,2) + " PL=" + DoubleToString(sp,2) + " negSell=" + IntegerToString(ns), x, y, clrTomato); y += 14;
+   Label("04", "NET Lots: " + DoubleToString(bl - sl,2) + " | FloatingDD=" + DoubleToString(CurrentFloatingDD(),2), x, y, clrWhite); y += 14;
+   Label("05", "24H High=" + DoubleToString(hi,_Digits) + " Low=" + DoubleToString(lo,_Digits), x, y, clrGold); y += 14;
+   Label("06", "NoSellBelow=" + DoubleToString(bottomLimit,_Digits) + " | NoBuyAbove=" + DoubleToString(topLimit,_Digits), x, y, clrGold); y += 14;
+   Label("07", "M15 Trend=" + m15 + " | SellAllowed=" + sellAllowed, x, y, clrWhite); y += 14;
+   Label("08", "Spacing: 1-15=" + DoubleToString(Spacing_L1_15_USD,1) + " 16-30=" + DoubleToString(Spacing_L16_30_USD,1) + " 31-50=" + DoubleToString(Spacing_L31_50_USD,1) + " 50+=" + DoubleToString(Spacing_L50Plus_USD,1), x, y, clrSilver); y += 14;
+   Label("09", "ProfitBankToday=" + DoubleToString(g_profitBank,2) + " | Usable30%=" + DoubleToString(usableBank,2), x, y, clrDeepSkyBlue); y += 14;
+   Label("10", "Modules: Buy=" + (EnableBuyGrid ? "ON" : "OFF") + " Sell=" + (EnableAutoSellModule ? "ON" : "OFF") + " Hedge=" + (EnableHedgeEngine ? "ON" : "OFF") + " Trail=" + (EnableTrailing ? "ON" : "OFF"), x, y, clrWhite); y += 14;
+   Label("11", "Trail BUY start=" + DoubleToString(BuyTrailStart_USD,1) + " lock=" + DoubleToString(BuyTrailLock_USD,1) + " gap=" + DoubleToString(BuyTrailGap_USD,1), x, y, clrLightSkyBlue); y += 14;
+}
+
+//---------------------- EVENTS -------------------------------------
+int OnInit()
+{
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(SlippagePoints);
+   Print(EA_Name, " initialized on ", _Symbol);
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason)
+{
+   ClearDashboard();
+}
+
+void OnTick()
+{
+   UpdateProfitBankFromHistory();
+
+   // Manage exits first, then entries.
+   ManageTrailingStops();
+
+   // Order: core buy first, then tactical sell, then hedge balancer.
+   ManageBuyGrid();
+   ManageSellModule();
+   ManageHedgeEngine();
+
+   DrawDashboard();
+}
+//+------------------------------------------------------------------+
